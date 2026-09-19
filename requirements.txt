@@ -1,0 +1,3 @@
+crewai
+chainlit
+python-dotenv
