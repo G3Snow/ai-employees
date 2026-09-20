@@ -39,7 +39,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-12"
+APP_BUILD = "group-chat-13"
 
 SPECIALIST_1_MODEL = os.getenv("SPECIALIST_1_MODEL", "anthropic/claude-sonnet-4-6")
 SPECIALIST_2_MODEL = os.getenv("SPECIALIST_2_MODEL", "openai/gpt-5.6-terra")
@@ -54,8 +54,30 @@ MAX_REVIEW_ROUNDS = max(1, min(2, MAX_AGREEMENT_ROUNDS))
 # combine its function tools with any other effort, so those models use the
 # Responses API instead. GPT-5.6 Terra is the same class of reasoning model.
 # low | medium | high | xhigh | max
-_OPENAI_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
-_DEFAULT_OPENAI_REASONING_EFFORT = "high"
+_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_ANTHROPIC_MAX_TOKENS = 8192
+# Anthropic recommends a large max_tokens at xhigh/max so thinking is not cut off.
+_ANTHROPIC_MAX_TOKENS_HIGH_EFFORT = 64000
+
+
+def _env_reasoning_effort(name: str, default: str) -> str:
+    raw = os.getenv(name, default)
+    effort = (raw or "").strip().lower()
+    if effort in _REASONING_EFFORTS:
+        return effort
+    logger.warning("%s=%r is not supported; using %s.", name, raw, default)
+    return default
+
+
+SPECIALIST_REASONING_EFFORT = _env_reasoning_effort(
+    "SPECIALIST_REASONING_EFFORT", "medium"
+)
+EVALUATOR_REASONING_EFFORT = _env_reasoning_effort(
+    "EVALUATOR_REASONING_EFFORT", "xhigh"
+)
+TECHNICAL_REASONING_EFFORT = _env_reasoning_effort(
+    "TECHNICAL_REASONING_EFFORT", "xhigh"
+)
 
 TRANSCRIPT_KEY = "transcript"
 PENDING_KEY = "pending_agreement"
@@ -276,6 +298,7 @@ class Employee:
     goal: str
     backstory: str
     brief: str
+    reasoning_effort: str
 
 
 _SPECIALIST_CORE = (
@@ -312,6 +335,7 @@ TEAM = (
             "official/OEM URLs you used. Do not write code unless the user asked "
             "for it. If you both agree the user must decide something, you ask them."
         ),
+        reasoning_effort=SPECIALIST_REASONING_EFFORT,
     ),
     Employee(
         name="Specialist 2",
@@ -332,6 +356,7 @@ TEAM = (
             "Do not write code unless the user asked for it. Do not address "
             "questions to the user; Specialist 1 does that when you both agree."
         ),
+        reasoning_effort=SPECIALIST_REASONING_EFFORT,
     ),
     Employee(
         name="Evaluator",
@@ -362,6 +387,7 @@ TEAM = (
             "when the plan is accurate and still serves the user's larger goal, "
             "so Technical can build it. Do not write code."
         ),
+        reasoning_effort=EVALUATOR_REASONING_EFFORT,
     ),
     Employee(
         name="Technical",
@@ -387,6 +413,7 @@ TEAM = (
             "Correct anything that would fail. If they asked you to update code "
             "or a document, produce the actual files now."
         ),
+        reasoning_effort=TECHNICAL_REASONING_EFFORT,
     ),
 )
 
@@ -450,17 +477,26 @@ def _stream_supported(model: str) -> bool:
     return not _needs_openai_responses(model)
 
 
-def _openai_reasoning_effort() -> str:
-    raw = os.getenv("OPENAI_REASONING_EFFORT", _DEFAULT_OPENAI_REASONING_EFFORT)
-    effort = (raw or "").strip().lower()
-    if effort in _OPENAI_REASONING_EFFORTS:
-        return effort
-    logger.warning(
-        "OPENAI_REASONING_EFFORT=%r is not supported; using %s.",
-        raw,
-        _DEFAULT_OPENAI_REASONING_EFFORT,
-    )
-    return _DEFAULT_OPENAI_REASONING_EFFORT
+def _ensure_anthropic_sends_output_config() -> None:
+    """CrewAI 1.15 keeps extra LLM kwargs in additional_params and never
+    forwards them to Anthropic, so output_config.effort would otherwise be dropped.
+    """
+    from crewai.llms.providers.anthropic.completion import AnthropicCompletion
+
+    prepare = AnthropicCompletion._prepare_completion_params
+    if getattr(prepare, "_sends_output_config", False):
+        return
+
+    def _prepare_with_output_config(self, *args, **kwargs):
+        params = prepare(self, *args, **kwargs)
+        extra = getattr(self, "additional_params", None) or {}
+        output_config = extra.get("output_config")
+        if output_config:
+            params["output_config"] = output_config
+        return params
+
+    _prepare_with_output_config._sends_output_config = True
+    AnthropicCompletion._prepare_completion_params = _prepare_with_output_config
 
 
 def _llm_kwargs(employee: Employee, stream: bool) -> dict:
@@ -469,11 +505,18 @@ def _llm_kwargs(employee: Employee, stream: bool) -> dict:
     kwargs: dict = dict(
         model=employee.model, stream=stream, timeout=REQUEST_TIMEOUT_SECONDS
     )
+    effort = employee.reasoning_effort
     if employee.model.startswith("anthropic/"):
-        kwargs["max_tokens"] = 8192
+        kwargs["max_tokens"] = (
+            _ANTHROPIC_MAX_TOKENS_HIGH_EFFORT
+            if effort in {"xhigh", "max"}
+            else _ANTHROPIC_MAX_TOKENS
+        )
+        kwargs["output_config"] = {"effort": effort}
+    if employee.model.startswith("openai/") or _needs_openai_responses(employee.model):
+        kwargs["reasoning_effort"] = effort
     if _needs_openai_responses(employee.model):
         kwargs["api"] = "responses"
-        kwargs["reasoning_effort"] = _openai_reasoning_effort()
     return kwargs
 
 
@@ -490,6 +533,8 @@ def _build_crew(
     tools = employee_tools(workspace)
     vision = incoming.vision_files(employee.model)
     stream = stream and _stream_supported(employee.model)
+    if employee.model.startswith("anthropic/"):
+        _ensure_anthropic_sends_output_config()
     llm_kwargs = _llm_kwargs(employee, stream)
     agent = Agent(
         role=employee.name,
