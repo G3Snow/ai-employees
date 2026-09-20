@@ -1,4 +1,4 @@
-"""Public-web search and page fetch for Executor / Evaluator fact-checking."""
+"""Public-web search and page fetch for specialist / Evaluator / Executor fact-checking."""
 
 from __future__ import annotations
 

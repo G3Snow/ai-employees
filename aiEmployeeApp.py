@@ -1,4 +1,4 @@
-"""A group chat where three AI employees each answer in their own message."""
+"""A group chat where five AI employees each answer in their own message."""
 
 import asyncio
 import hmac
@@ -39,32 +39,46 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-10"
+APP_BUILD = "group-chat-11"
 
-EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-6-astra")
+SPECIALIST_1_MODEL = os.getenv("SPECIALIST_1_MODEL", "anthropic/claude-sonnet-4-6")
+SPECIALIST_2_MODEL = os.getenv("SPECIALIST_2_MODEL", "openai/gpt-5.6-terra")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-fable-5-1")
+EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-6-astra")
 TECHNICAL_MODEL = os.getenv("TECHNICAL_MODEL", "anthropic/claude-opus-5")
 TURN_TIMEOUT_SECONDS = int(os.getenv("TURN_TIMEOUT_SECONDS", "900"))
 # Bounds the provider call itself; the turn timeout alone cannot stop one already running.
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "840"))
 MAX_AGREEMENT_ROUNDS = max(1, int(os.getenv("MAX_AGREEMENT_ROUNDS", "3")))
+MAX_REVIEW_ROUNDS = max(1, min(2, MAX_AGREEMENT_ROUNDS))
 # GPT-6 Astra rejects reasoning_effort="none". Chat Completions also cannot
 # combine its function tools with any other effort, so those models use the
-# Responses API instead. low | medium | high | xhigh | max
+# Responses API instead. GPT-5.6 Terra is the same class of reasoning model.
+# low | medium | high | xhigh | max
 _OPENAI_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _DEFAULT_OPENAI_REASONING_EFFORT = "high"
 
 TRANSCRIPT_KEY = "transcript"
 PENDING_KEY = "pending_agreement"
+PENDING_QUESTION_KEY = "pending_user_question"
+PHASE_KEY = "pipeline_phase"
 CHECKIN_MSG_KEY = "agreement_checkin_msg"
 BUSY_KEY = "team_busy"
 STALLED_KEY = "agreement_stalled"
-MAX_TRANSCRIPT_ENTRIES = 50
+MAX_TRANSCRIPT_ENTRIES = 80
 MAX_ENTRY_CHARS = 4000
 
 _AGREEMENT_LINE = re.compile(r"(?im)^\s*AGREEMENT:\s*(yes|no)\b")
-EMPLOYEE_NAMES = ("Executor", "Evaluator", "Technical")
-_NAME_TOKEN = r"Executor|Evaluator|Technical"
+_ASK_USER_LINE = re.compile(r"(?im)^\s*ASK_USER:\s*(yes|no)\b")
+EMPLOYEE_NAMES = (
+    "Specialist 1",
+    "Specialist 2",
+    "Evaluator",
+    "Executor",
+    "Technical",
+)
+SPECIALIST_NAMES = ("Specialist 1", "Specialist 2")
+_NAME_TOKEN = r"Specialist 1|Specialist 2|Executor|Evaluator|Technical"
 _OPENING_ADDRESS = re.compile(
     rf"^\s*(?:(?:hey|hi|hello|ok|okay|please)\s+)?"
     rf"((?:@?(?:{_NAME_TOKEN}))(?:\s*(?:,|\band\b|&|/)\s*@?(?:{_NAME_TOKEN}))*)"
@@ -78,11 +92,18 @@ _VOCATIVE = re.compile(
 )
 _AT_NAME = re.compile(rf"@({_NAME_TOKEN})\b", re.I)
 _CHECKIN_MARKER = "have not independently agreed after"
+_QUESTION_MARKER = "need your input before they continue"
+_ADVANCE_PHRASES = {
+    "specialists": "sent this to Evaluator",
+    "evaluator": "sent this to Executor",
+    "executor": "sent this to Technical",
+}
 
 COLLABORATION_PROTOCOL = """
-You are in a live group chat with the user and two teammates:
-Executor (researched plan), Evaluator (project manager and fact-checker),
-Technical (deployment plan and implementation).
+You are in a live group chat with the user and four teammates:
+Specialist 1 (lead planner), Specialist 2 (planning partner),
+Evaluator (fact-checker of the specialists' plan), Executor (project manager:
+validation, accuracy, anti-hallucination), Technical (coding and building).
 Write one complete chat message now. Never wait for anyone else to speak.
 - Open with one short sentence on who should lead this request and why, then do your job.
 - If a teammate already assigned roles and you agree, say so in one clause and continue.
@@ -95,8 +116,10 @@ Write one complete chat message now. Never wait for anyone else to speak.
 - For facts about products, APIs, vendors, or procedures: use search_web and fetch_url.
   Prefer official company, OEM, and vendor documentation. Reddit is allowed only when
   later replies in the same thread confirm the approach actually worked.
-- The user may address you by name (`Executor, …` or `@Evaluator`). Follow that
+- The user may address you by name (`Specialist 1, …` or `@Evaluator`). Follow that
   instruction; it outranks a teammate's last request, but not the user's original goal.
+- Specialists hash out the plan. Evaluator fact-checks it. Executor signs off only
+  when the thread is accurate and still on the user's goal. Technical then builds it.
 """
 
 AGREEMENT_FOOTER = """
@@ -107,43 +130,125 @@ Use yes only if you independently verified the latest revised plan and accept it
 as correct, viable, and still serving the user's larger goal. Never rubber-stamp.
 """
 
-EXECUTOR_DRAFT = """
-This is your first pass. Research before you plan. Use search_web and fetch_url
-whenever the request depends on external products, APIs, vendors, or procedures.
-Cite URLs. Prefer official company and OEM pages. Reddit only if replies in that
-thread confirm success. Do not mark AGREEMENT: yes yet.
-""" + AGREEMENT_FOOTER
+SPECIALIST_FOOTER = (
+    AGREEMENT_FOOTER
+    + """
+Then end with exactly one of these lines, on its own:
+ASK_USER: no
+ASK_USER: yes
+ASK_USER: yes only if you and your specialist counterpart both need a decision
+only the user can make (a preference, credential, constraint, or choice that is
+not in the thread and cannot be reasonably assumed). Do not ask the user to be
+polite, to confirm a plan, or for facts you can look up. If AGREEMENT: yes,
+ASK_USER must be no. Specialist 1 is the only specialist who asks the user;
+Specialist 2 proposes questions to Specialist 1, never to the user directly.
+"""
+)
+
+SPECIALIST_1_DRAFT = """
+This is your first pass. You lead. Research before you plan. Use search_web and
+fetch_url whenever the request depends on external products, APIs, vendors, or
+procedures. Cite URLs. Prefer official company and OEM pages. Reddit only if
+replies in that thread confirm success. Ask Specialist 2 the questions that would
+most improve the plan. Do not mark AGREEMENT: yes yet. ASK_USER: yes only if
+planning cannot continue without the user.
+""" + SPECIALIST_FOOTER
+
+SPECIALIST_2_FIRST = """
+This is your first pass. Do not mark AGREEMENT: yes yet. Challenge Specialist 1.
+Ask them pointed questions. Independently fact-check their claims with official
+sources via search_web and fetch_url. Do not trust their citations without
+fetching them. Post your own researched additions and a revised plan. ASK_USER:
+yes only if you agree with Specialist 1 that the user must decide something
+before you can continue.
+""" + SPECIALIST_FOOTER
+
+SPECIALIST_REBUTTAL = """
+Keep working with your specialist counterpart. Ask them the next questions that
+would make the plan more accurate. Independently verify their claims with
+official sources. Concede only what you confirm is wrong; argue for what still
+holds. Expand the detailed plan as far as the facts allow. Do not involve the
+user unless you both agree it is blocking.
+""" + SPECIALIST_FOOTER
+
+SPECIALIST_1_ASK_USER = """
+You and Specialist 2 both agreed the user must decide something before you can
+continue. Stop planning. Address the user directly. Ask only the blocking
+questions you both agreed on. Number them. Wait for their reply; do not guess.
+AGREEMENT: no. ASK_USER: yes.
+""" + SPECIALIST_FOOTER
+
+SPECIALIST_AFTER_USER = """
+The user answered. Incorporate every answer into the plan. Do not re-ask unless
+something is still truly blocking and your counterpart also agrees. Continue
+fact-checking each other and building the detailed plan.
+""" + SPECIALIST_FOOTER
 
 EVALUATOR_FIRST = """
-This is your first review. Do not mark AGREEMENT: yes yet.
+The specialists have submitted a plan. This is your first review.
 Primary job: read EVERY message in this thread. Catch hallucinations, dropped
-constraints, and drift away from the user's larger project. You are the project
-manager. Translate the Executor's draft into a plan that still serves that goal.
-Assume the Executor made mistakes. Independently fact-check their claims with
-official sources via search_web and fetch_url. Do not trust their citations
-without fetching them. Keep the feasibility stress-test: what breaks, and whether
-the user can actually do it.
+constraints, and drift away from the user's larger project. Independently
+fact-check the specialists' claims with official sources via search_web and
+fetch_url. Do not trust their citations without fetching them. Identify major
+issues and fix them in a revised plan. Keep the feasibility stress-test: what
+breaks, and whether the user can actually do it. AGREEMENT: yes only if the
+plan is factually sound and major issues are fixed.
 """ + AGREEMENT_FOOTER
 
-EXECUTOR_REBUTTAL = """
-Evaluator challenged your plan. Do not trust that critique by default.
-Independently verify their claims with official sources. Concede only what you
-confirm is wrong; argue for what still holds. Post the revised plan with citations.
+EVALUATOR_HANDOFF = """
+The specialists did not fully agree. The user told Front desk to send you what
+they have. Prefer the overlap they already share. Treat remaining disagreements
+as risks. Independently fact-check with official sources. Fix major issues.
 """ + AGREEMENT_FOOTER
 
 EVALUATOR_REBUTTAL = """
-Continue as project manager. Re-read the whole thread. Fact-check Executor again
-with official sources. Argue remaining issues. You two must both independently
-agree before Technical is allowed to see this. Keep the plan inside the user's
-larger goal.
+Continue fact-checking. Re-read the whole thread. Verify the specialists' latest
+fixes with official sources. Identify remaining major issues and fix them.
+AGREEMENT: yes only if you independently accept the revised plan.
 """ + AGREEMENT_FOOTER
 
+SPECIALIST_AFTER_EVALUATOR = """
+Evaluator found issues in your plan. Do not trust that critique by default.
+Independently verify their claims. Fix what you confirm is wrong. Keep the
+detailed plan intact where it still holds. You two must get this sound enough
+for Evaluator to accept it.
+""" + SPECIALIST_FOOTER
+
+EXECUTOR_REVIEW = """
+You are the project manager. The specialists hashed out a plan and Evaluator
+fact-checked it. Your job is validation, accuracy, and keeping this entire chat
+aligned to the user's goal so nothing hallucinated or drifted slips through.
+Re-read EVERY message. Catch invented facts, dropped constraints, and scope
+creep. Do not rubber-stamp. AGREEMENT: yes only if the thread is accurate,
+internally consistent, and ready for Technical to build. Do not write code.
+""" + AGREEMENT_FOOTER
+
+EXECUTOR_HANDOFF = """
+The prior stage did not fully sign off. The user told Front desk to send you
+what they have. Prefer the overlap already in the thread. Validate accuracy,
+catch hallucinations, and keep the work on the user's goal. Flag leftover
+risks clearly. AGREEMENT: yes only if you can stand behind sending this to
+Technical.
+""" + AGREEMENT_FOOTER
+
+EXECUTOR_REBUTTAL = """
+You are not yet satisfied. Re-read the whole thread. Call out remaining
+accuracy, alignment, or hallucination problems. The specialists will fix them.
+AGREEMENT: yes only when the plan is safe to hand to Technical.
+""" + AGREEMENT_FOOTER
+
+SPECIALIST_AFTER_EXECUTOR = """
+Executor (project manager) is not satisfied. Treat that as a validation fail,
+not a rewrite-from-scratch. Independently check their claims. Fix accuracy,
+alignment, and hallucination issues they confirmed. Keep the plan detailed.
+""" + SPECIALIST_FOOTER
+
 TECHNICAL_AFTER_AGREEMENT = """
-Executor and Evaluator have reached firm agreement. Use only that agreed revised
-plan. Translate it into a technical deployment plan the way a highly skilled
-engineer would: proven production practices, current official docs, nothing
-experimental (no beta APIs, unproven libraries, or clever unpublished tricks).
-Check platforms, correct anything that would fail, and think through failure modes.
+Executor has signed off. Use only the signed-off plan. Your job is to code and
+build what that plan asks for. Work the way a highly skilled engineer would:
+proven production practices, current official docs, nothing experimental (no
+beta APIs, unproven libraries, or clever unpublished tricks). Check platforms,
+correct anything that would fail, and think through failure modes.
 If the user asked for action (update code, edit a document, produce a file),
 carry it out now with write_text_file or write_spreadsheet. Ship the actual
 artifact, not a description of the change.
@@ -154,11 +259,12 @@ The user asked you to keep working toward independent agreement. Do not fake
 consensus. Continue the debate and fact-check with official sources.
 """
 
-COMPROMISE_EXECUTOR = """
+COMPROMISE_SPECIALIST = """
 The user asked you to lower the bar a little so a plan can ship. Keep what you
-and Evaluator already share. Drop remaining disagreements that are not unsafe,
-factually wrong, or against the user's goal. Post that most-agreed plan.
-""" + AGREEMENT_FOOTER
+and your specialist counterpart already share. Drop remaining disagreements
+that are not unsafe, factually wrong, or against the user's goal. Post that
+most-agreed plan.
+""" + SPECIALIST_FOOTER
 
 COMPROMISE_EVALUATOR = """
 The user asked you to lower the bar a little. Do not rubber-stamp something
@@ -167,25 +273,32 @@ you already share the most can proceed. AGREEMENT: yes only if you can stand
 behind that compromise.
 """ + AGREEMENT_FOOTER
 
+COMPROMISE_EXECUTOR = """
+The user asked you to lower the bar a little so work can reach Technical. Keep
+what is already accurate and on-goal. Drop remaining non-deal-breaker
+objections. AGREEMENT: yes only if you can stand behind sending that version
+to Technical.
+""" + AGREEMENT_FOOTER
+
 TECHNICAL_HANDOFF = """
-Executor and Evaluator did not fully agree. The user told Front desk to send you
-what they have anyway. Use the latest plans in the thread. Prefer the overlap
-they already share. Treat remaining disagreements as risks to call out, then
-write a technically realistic deployment plan from proven practices. If the user
-asked for action, carry it out.
+The team did not fully agree. The user told Front desk to send you what they
+have anyway. Use the latest plans in the thread. Prefer the overlap they
+already share. Treat remaining disagreements as risks to call out, then code
+and build what that overlap asks for from proven practices. If the user asked
+for action, carry it out.
 """
 
 TECHNICAL_DIRECTED = """
 The user addressed you by name. Follow their instruction. Use the current thread.
-If Executor and Evaluator never fully agreed, prefer their overlap and flag
-leftovers as risks. Still use proven practices only. If they asked for action,
-carry it out.
+If earlier stages never fully agreed, prefer their overlap and flag leftovers
+as risks. Still use proven practices only. Code and build what was asked.
+If they asked for action, carry it out.
 """
 
-CHOICE_LABELS = {
-    "continue": "Keep arguing",
-    "compromise": "Lower the bar a little",
-    "technical": "Send what they have to Technical",
+ADVANCE_LABELS = {
+    "specialists": "Send to Evaluator",
+    "evaluator": "Send to Executor",
+    "executor": "Send to Technical",
 }
 
 
@@ -199,28 +312,59 @@ class Employee:
     brief: str
 
 
+_SPECIALIST_CORE = (
+    "You are a pragmatic project executor. You take messy input and turn it into "
+    "a plan someone can actually start: objective, steps, owners, tools, and a "
+    "realistic sequence. You build the big plan from current public knowledge: "
+    "official company and OEM websites first. You may use Reddit only when later "
+    "replies in the same thread confirm the approach worked. You do not "
+    "over-engineer simple requests, and you never invent citations. You work "
+    "with your specialist counterpart: ask them pointed questions, independently "
+    "fact-check their claims, and keep expanding the plan until it is as detailed "
+    "as the facts allow. You two only involve the user when you both agree a "
+    "decision is impossible without their input."
+)
+
 TEAM = (
     Employee(
-        name="Executor",
-        model=EXECUTOR_MODEL,
+        name="Specialist 1",
+        model=SPECIALIST_1_MODEL,
         thinking="is researching the plan…",
         goal=(
-            "Turn the user's request into a researched, executable project plan "
-            "grounded in official sources, then defend it until Evaluator independently agrees."
+            "Lead planning with Specialist 2: research an executable project plan "
+            "from official sources, fact-check each other, and only ask the user "
+            "when you both agree their input is required."
         ),
         backstory=(
-            "You are a pragmatic project executor. You take messy input and turn it into "
-            "a plan someone can actually start: objective, steps, owners, tools, and a "
-            "realistic sequence. You build the big plan from current public knowledge: "
-            "official company and OEM websites first. You may use Reddit only when later "
-            "replies in the same thread confirm the approach worked. You do not "
-            "over-engineer simple requests, and you never invent citations."
+            f"{_SPECIALIST_CORE} You always take the lead with the user: if you "
+            "both agree a question is blocking, you are the one who asks it."
         ),
         brief=(
             "Lead with one sentence on who should lead this, then post an executable "
             "plan: goal, steps, tools, order of work, and what done looks like. "
-            "Cite the official/OEM URLs you used. Do not write code unless the user "
-            "asked for it."
+            "Ask Specialist 2 the questions that would most improve it. Cite the "
+            "official/OEM URLs you used. Do not write code unless the user asked "
+            "for it. If you both agree the user must decide something, you ask them."
+        ),
+    ),
+    Employee(
+        name="Specialist 2",
+        model=SPECIALIST_2_MODEL,
+        thinking="is challenging the plan…",
+        goal=(
+            "Partner with Specialist 1 on the same executor work: research, question, "
+            "fact-check, and expand the plan until you both independently agree. "
+            "Never ask the user directly; propose questions to Specialist 1."
+        ),
+        backstory=(
+            f"{_SPECIALIST_CORE} You never ask the user directly. If a question "
+            "needs the user, tell Specialist 1; they ask."
+        ),
+        brief=(
+            "Challenge and improve Specialist 1's plan. Ask them pointed questions, "
+            "fact-check with official sources, and add missing steps. Cite URLs. "
+            "Do not write code unless the user asked for it. Do not address "
+            "questions to the user; Specialist 1 does that when you both agree."
         ),
     ),
     Employee(
@@ -228,51 +372,73 @@ TEAM = (
         model=EVALUATOR_MODEL,
         thinking="is auditing the thread…",
         goal=(
-            "Keep the whole thread honest and on-project: catch hallucinations and drift, "
-            "fact-check the Executor (assuming mistakes), and translate their draft into "
-            "a plan that still serves the user's larger goal."
+            "Fact-check the specialists' plan: assume mistakes, verify with "
+            "official sources, and identify and fix major issues."
         ),
         backstory=(
-            "You are a skeptical project manager, not a rubber stamp. Your primary job is "
-            "to read the entire chat, notice when the team is hallucinating or losing the "
-            "plot, and pull the work back to the user's actual larger goal. You assume the "
-            "Executor got things wrong. You independently verify claims with official "
-            "company, OEM, and vendor documentation. You also stress-test executability: "
-            "missing steps, false assumptions, scope that is too big, skills the user may "
-            "not have, and failure points. You say clearly if the plan is doable, what "
-            "would break, and how to shrink it so a single person can execute it."
+            "You are a skeptical fact-checker, not a rubber stamp. The specialists "
+            "submit a researched plan. You assume they got things wrong. You "
+            "independently verify claims with official company, OEM, and vendor "
+            "documentation. You catch hallucinations and drift, stress-test "
+            "executability (missing steps, false assumptions, scope that is too "
+            "big, skills the user may not have, failure points), and fix major "
+            "issues in a revised plan. You are not the project manager; Executor is."
         ),
         brief=(
-            "Confirm or correct who should lead in one clause. Audit the whole thread "
-            "for hallucinations and project drift. Fact-check the Executor with official "
-            "sources. Say whether the plan can actually be executed, what errors or gaps "
-            "exist, and whether one person can do it alone. Give a verdict and a revised "
-            "plan that stays inside the user's larger goal."
+            "Confirm or correct who should lead in one clause. Audit the whole "
+            "thread. Fact-check the specialists with official sources. Identify "
+            "major issues and fix them. Say whether the plan can actually be "
+            "executed. Give a verdict and a revised plan that stays inside the "
+            "user's larger goal."
+        ),
+    ),
+    Employee(
+        name="Executor",
+        model=EXECUTOR_MODEL,
+        thinking="is validating the thread…",
+        goal=(
+            "Act as overall project manager: validate accuracy, keep the whole "
+            "chat aligned to the user's goal, prevent hallucination, and only "
+            "then release the plan to Technical."
+        ),
+        backstory=(
+            "You are the project manager. You do not draft the plan from scratch "
+            "and you do not write the code. You read the entire thread after the "
+            "specialists and Evaluator have worked, then you check that every "
+            "claim is still true, every user constraint is still present, and "
+            "the team has not drifted or hallucinated. You send work back until "
+            "you would bet on it. When you are satisfied, Technical may build."
+        ),
+        brief=(
+            "Validate the current plan against the whole thread. Call out "
+            "inaccuracy, hallucination, and project drift. Do not write code. "
+            "Sign off only when the plan is accurate and still serves the user's "
+            "larger goal, so Technical can build it."
         ),
     ),
     Employee(
         name="Technical",
         model=TECHNICAL_MODEL,
-        thinking="is writing the deployment plan…",
+        thinking="is building from the plan…",
         goal=(
-            "Turn the agreed Executor/Evaluator plan into a technically realistic "
-            "deployment plan, then carry it out if the user asked for action."
+            "Code and build what the signed-off plan asks for, using only proven "
+            "production practices."
         ),
         backstory=(
-            "You are a highly skilled hands-on engineer. You review the plan passed to "
-            "you only after Executor and Evaluator have both agreed it is correct. You "
-            "check whether the proposed stack can actually do the job, fix incorrect APIs, "
-            "code, or architecture, and replace wishful tooling with something that exists "
-            "and is production-proven. You refuse experimental or unproven approaches. "
-            "You think through failure modes, then tighten the plan until you would bet "
-            "on it. When the user asked for a change, you make the change."
+            "You are a highly skilled hands-on engineer. You work from the plan "
+            "Executor signed off. Your main job is coding and building that plan, "
+            "not reinventing it. You check whether the proposed stack can actually "
+            "do the job, fix incorrect APIs, code, or architecture, and replace "
+            "wishful tooling with something that exists and is production-proven. "
+            "You refuse experimental or unproven approaches. You think through "
+            "failure modes, then you implement. When the user asked for a change, "
+            "you make the change."
         ),
         brief=(
-            "Confirm roles in one clause unless you must dissent. Translate the agreed "
-            "plan into a technical deployment plan using only proven practices. Check "
-            "whether the proposed platforms can do the work, correct anything that would "
-            "fail, and end with the final plan the user should follow. If they asked you "
-            "to update code or a document, produce the actual files now."
+            "Confirm roles in one clause unless you must dissent. Code and build "
+            "what the signed-off plan asks for, using only proven practices. "
+            "Correct anything that would fail. If they asked you to update code "
+            "or a document, produce the actual files now."
         ),
     ),
 )
@@ -311,13 +477,18 @@ def _model_leaf(model: str) -> str:
 
 
 def _needs_openai_responses(model: str) -> bool:
-    """GPT-6 Astra can call tools only on the Responses API.
+    """GPT-6 Astra and GPT-5.6 Terra can call tools only on the Responses API.
 
     CrewAI defaults to Chat Completions. That path gets a 400 for tools +
     reasoning, then retries with reasoning_effort="none", which Astra rejects.
     """
     name = _model_leaf(model)
-    return name.startswith("gpt-6") or "astra" in name
+    return (
+        name.startswith("gpt-6")
+        or name.startswith("gpt-5.6")
+        or "astra" in name
+        or "terra" in name
+    )
 
 
 def _stream_supported(model: str) -> bool:
@@ -326,7 +497,8 @@ def _stream_supported(model: str) -> bool:
     Chat Completions streaming already hands those tool calls back to the agent.
     The Responses stream path does not, so CrewAI raises
     ``ValueError: Invalid response from LLM call - None or empty.``
-    Astra can only use tools on Responses, so it cannot stream until that is fixed.
+    Astra/Terra can only use tools on Responses, so they cannot stream until
+    that is fixed.
     """
     return not _needs_openai_responses(model)
 
@@ -588,13 +760,27 @@ def _named(name: str) -> Employee:
     raise KeyError(name)
 
 
+def _last_marker(pattern: re.Pattern, text: str) -> Optional[str]:
+    matches = pattern.findall(text or "")
+    return matches[-1].lower() if matches else None
+
+
 def _agrees(text: str) -> bool:
-    matches = _AGREEMENT_LINE.findall(text or "")
-    return bool(matches) and matches[-1].lower() == "yes"
+    return _last_marker(_AGREEMENT_LINE, text) == "yes"
 
 
-def _both_agree(executor_text: str, evaluator_text: str) -> bool:
-    return _agrees(executor_text) and _agrees(evaluator_text)
+def _asks_user(text: str) -> bool:
+    return _last_marker(_ASK_USER_LINE, text) == "yes"
+
+
+def _both_agree(left: str, right: str) -> bool:
+    return _agrees(left) and _agrees(right)
+
+
+def _both_ask_user(left: str, right: str) -> bool:
+    if _both_agree(left, right):
+        return False
+    return _asks_user(left) and _asks_user(right)
 
 
 def _canon_name(raw: str) -> Optional[str]:
@@ -654,11 +840,24 @@ def parse_named_instructions(text: str) -> dict[str, str]:
     return {name: " ".join(instruction.split()).strip(" ,") for name, instruction in notes.items()}
 
 
-def parse_agreement_choice(text: str) -> Optional[str]:
-    """Return continue / compromise / technical from a free-text reply, if any."""
+def _advance_label(phase: Optional[str]) -> str:
+    return ADVANCE_LABELS.get(phase or "specialists", ADVANCE_LABELS["specialists"])
+
+
+def _choice_labels(phase: Optional[str] = None) -> dict[str, str]:
+    return {
+        "continue": "Keep arguing",
+        "compromise": "Lower the bar a little",
+        "advance": _advance_label(phase),
+    }
+
+
+def parse_agreement_choice(text: str, phase: Optional[str] = None) -> Optional[str]:
+    """Return continue / compromise / advance / technical from a free-text reply, if any."""
     stripped = (text or "").strip()
     lowered = stripped.lower()
-    for key, label in CHOICE_LABELS.items():
+    labels = _choice_labels(phase)
+    for key, label in labels.items():
         if lowered == label.lower():
             return key
     if re.search(
@@ -667,7 +866,16 @@ def parse_agreement_choice(text: str) -> Optional[str]:
         lowered,
         re.S,
     ):
+        if (phase or "specialists") == "executor":
+            return "advance"
         return "technical"
+    if re.search(
+        r"\b((send|give|pass|hand)\b.{0,40}\b(evaluator|executor)\b|"
+        r"send to (the )?(evaluator|executor))\b",
+        lowered,
+        re.S,
+    ):
+        return "advance"
     if re.search(
         r"\b(compromise|lower the bar|reduce (the )?standards|relax (the )?(standards|bar)|"
         r"most agreed|good enough)\b",
@@ -692,6 +900,12 @@ def _user_note_brief(name: str, instruction: str) -> str:
     )
 
 
+def _with_note(name: str, extra: str, notes: dict[str, str]) -> str:
+    if name in notes:
+        return _user_note_brief(name, notes[name]) + extra
+    return extra
+
+
 def _directed_brief(employee: Employee, instruction: str, wants_agreement: bool) -> str:
     note = _user_note_brief(employee.name, instruction)
     if employee.name == "Technical":
@@ -702,8 +916,13 @@ def _directed_brief(employee: Employee, instruction: str, wants_agreement: bool)
             + "The rest of the team is silent this turn unless also named. Reply now. "
             "Skip the AGREEMENT line unless you are actually accepting a plan."
         )
-    extra = EXECUTOR_REBUTTAL if employee.name == "Executor" else EVALUATOR_REBUTTAL
-    return note + extra
+    extras = {
+        "Specialist 1": SPECIALIST_REBUTTAL,
+        "Specialist 2": SPECIALIST_REBUTTAL,
+        "Evaluator": EVALUATOR_REBUTTAL,
+        "Executor": EXECUTOR_REBUTTAL,
+    }
+    return note + extras.get(employee.name, SPECIALIST_REBUTTAL)
 
 
 async def _run_turn(
@@ -726,34 +945,48 @@ async def _run_turn(
     return reply, ok
 
 
-async def _agreement_rounds(
+def _last_round_hint(kind: str) -> str:
+    if kind == "compromise":
+        return (
+            "\nThis is the last compromise round. Agree if you can stand behind the "
+            "most-shared plan; keep AGREEMENT: no if it is still wrong or off-goal.\n"
+        )
+    return (
+        "\nThis is the last debate round. Do not fake consensus. "
+        "If you cannot independently agree, keep AGREEMENT: no.\n"
+    )
+
+
+async def _specialist_rounds(
     request: str,
     incoming: IncomingFiles,
     failed: list[str],
     *,
     rounds: int,
-    executor_extra: str,
-    evaluator_extra: str,
+    s1_extra: str,
+    s2_extra: str,
     lead: Optional[str] = None,
     last_round_hint: str,
-) -> bool:
-    executor = _named("Executor")
-    evaluator = _named("Evaluator")
-    order = [evaluator, executor] if lead == "Evaluator" else [executor, evaluator]
-    replies = {"Executor": "", "Evaluator": ""}
+) -> str:
+    first = _named("Specialist 1")
+    second = _named("Specialist 2")
+    order = [second, first] if lead == "Specialist 2" else [first, second]
+    replies = {"Specialist 1": "", "Specialist 2": ""}
     for round_index in range(1, rounds + 1):
         hint = last_round_hint if round_index == rounds else ""
         for employee in order:
-            extra = executor_extra if employee.name == "Executor" else evaluator_extra
+            extra = s1_extra if employee.name == "Specialist 1" else s2_extra
             reply, ok = await _run_turn(
                 employee, request, incoming, failed, extra + hint
             )
             if not ok:
-                return False
+                return "failed"
             replies[employee.name] = reply
-        if _both_agree(replies["Executor"], replies["Evaluator"]):
-            return True
-    return False
+        if _both_ask_user(replies["Specialist 1"], replies["Specialist 2"]):
+            return "ask_user"
+        if _both_agree(replies["Specialist 1"], replies["Specialist 2"]):
+            return "agreed"
+    return "stalled"
 
 
 async def _send_to_technical(
@@ -765,51 +998,220 @@ async def _send_to_technical(
     await _run_turn(_named("Technical"), request, incoming, failed, extra_brief)
 
 
+async def _prompt_for_user_input(
+    request: str, incoming: IncomingFiles, failed: list[str]
+) -> None:
+    _, ok = await _run_turn(
+        _named("Specialist 1"), request, incoming, failed, SPECIALIST_1_ASK_USER
+    )
+    if not ok:
+        return
+    note = (
+        f"{_nameplate('Front desk')}"
+        f"The specialists agree they {_QUESTION_MARKER}. "
+        "Answer Specialist 1's questions in chat and they will pick the plan back up."
+    )
+    _remember("Front desk", note)
+    await _bubble("Front desk", note).send()
+    cl.user_session.set(PENDING_QUESTION_KEY, True)
+    cl.user_session.set(STALLED_KEY, False)
+
+
+async def _signoff_rounds(
+    reviewer: Employee,
+    request: str,
+    incoming: IncomingFiles,
+    failed: list[str],
+    *,
+    first_extra: str,
+    reject_extra: str,
+    specialist_extra: str,
+    rounds: int,
+    last_round_hint: str,
+) -> str:
+    reply, ok = await _run_turn(reviewer, request, incoming, failed, first_extra)
+    if not ok:
+        return "failed"
+    if _agrees(reply):
+        return "agreed"
+    for round_index in range(1, rounds + 1):
+        hint = last_round_hint if round_index == rounds else ""
+        for name in SPECIALIST_NAMES:
+            _, spec_ok = await _run_turn(
+                _named(name), request, incoming, failed, specialist_extra + hint
+            )
+            if not spec_ok:
+                return "failed"
+        reply, ok = await _run_turn(
+            reviewer, request, incoming, failed, reject_extra + hint
+        )
+        if not ok:
+            return "failed"
+        if _agrees(reply):
+            return "agreed"
+    return "stalled"
+
+
+async def _continue_pipeline(
+    request: str,
+    incoming: IncomingFiles,
+    failed: list[str],
+    *,
+    from_stage: str,
+    forced: bool = False,
+    compromise: bool = False,
+) -> str:
+    """Run Evaluator → Executor → Technical from the given stage inclusive."""
+    last_hint = _last_round_hint("compromise" if compromise else "debate")
+    stalled_here = bool(cl.user_session.get(STALLED_KEY)) and _phase() == from_stage
+    if from_stage == "evaluator":
+        cl.user_session.set(PHASE_KEY, "evaluator")
+        if forced:
+            eval_first = EVALUATOR_HANDOFF
+        elif compromise:
+            eval_first = COMPROMISE_EVALUATOR
+        elif stalled_here:
+            eval_first = EVALUATOR_REBUTTAL + CONTINUE_HINT
+        else:
+            eval_first = EVALUATOR_FIRST
+        eval_reject = COMPROMISE_EVALUATOR if compromise else EVALUATOR_REBUTTAL
+        spec_fix = COMPROMISE_SPECIALIST if compromise else SPECIALIST_AFTER_EVALUATOR
+        status = await _signoff_rounds(
+            _named("Evaluator"),
+            request,
+            incoming,
+            failed,
+            first_extra=eval_first,
+            reject_extra=eval_reject,
+            specialist_extra=spec_fix,
+            rounds=MAX_REVIEW_ROUNDS,
+            last_round_hint=last_hint,
+        )
+        if status != "agreed":
+            return status
+        forced = False
+        stalled_here = False
+        from_stage = "executor"
+
+    if from_stage == "executor":
+        cl.user_session.set(PHASE_KEY, "executor")
+        if forced:
+            exec_first = EXECUTOR_HANDOFF
+        elif compromise:
+            exec_first = COMPROMISE_EXECUTOR
+        elif stalled_here:
+            exec_first = EXECUTOR_REBUTTAL + CONTINUE_HINT
+        else:
+            exec_first = EXECUTOR_REVIEW
+        exec_reject = COMPROMISE_EXECUTOR if compromise else EXECUTOR_REBUTTAL
+        spec_fix = COMPROMISE_SPECIALIST if compromise else SPECIALIST_AFTER_EXECUTOR
+        status = await _signoff_rounds(
+            _named("Executor"),
+            request,
+            incoming,
+            failed,
+            first_extra=exec_first,
+            reject_extra=exec_reject,
+            specialist_extra=spec_fix,
+            rounds=MAX_REVIEW_ROUNDS,
+            last_round_hint=last_hint,
+        )
+        if status != "agreed":
+            return status
+        forced = False
+        from_stage = "technical"
+
+    await _send_to_technical(
+        request,
+        incoming,
+        failed,
+        TECHNICAL_HANDOFF if forced else TECHNICAL_AFTER_AGREEMENT,
+    )
+    if failed:
+        return "failed"
+    cl.user_session.set(PHASE_KEY, None)
+    cl.user_session.set(STALLED_KEY, False)
+    return "agreed"
+
+
+async def _run_specialists(
+    request: str,
+    incoming: IncomingFiles,
+    failed: list[str],
+    *,
+    first_pass: bool,
+    rounds: int,
+    s1_extra: str,
+    s2_extra: str,
+    lead: Optional[str] = None,
+    last_round_hint: str,
+) -> str:
+    replies = {"Specialist 1": "", "Specialist 2": ""}
+    if first_pass:
+        reply, ok = await _run_turn(
+            _named("Specialist 1"), request, incoming, failed, SPECIALIST_1_DRAFT
+        )
+        if not ok:
+            return "failed"
+        replies["Specialist 1"] = reply
+        reply, ok = await _run_turn(
+            _named("Specialist 2"), request, incoming, failed, SPECIALIST_2_FIRST
+        )
+        if not ok:
+            return "failed"
+        replies["Specialist 2"] = reply
+        if _both_ask_user(replies["Specialist 1"], replies["Specialist 2"]):
+            return "ask_user"
+        if _both_agree(replies["Specialist 1"], replies["Specialist 2"]):
+            return "agreed"
+    return await _specialist_rounds(
+        request,
+        incoming,
+        failed,
+        rounds=rounds,
+        s1_extra=s1_extra,
+        s2_extra=s2_extra,
+        lead=lead,
+        last_round_hint=last_round_hint,
+    )
+
+
 async def _collaborate(
     request: str, incoming: IncomingFiles
-) -> tuple[list[str], bool]:
-    """Executor drafts, Evaluator reviews, they debate, Technical only after both agree."""
+) -> tuple[list[str], str]:
+    """Specialists debate, Evaluator fact-checks, Executor signs off, then Technical builds."""
     failed: list[str] = []
-    executor = _named("Executor")
-    evaluator = _named("Evaluator")
-    agreed = False
-
-    _, executor_ok = await _run_turn(
-        executor, request, incoming, failed, EXECUTOR_DRAFT
+    cl.user_session.set(PHASE_KEY, "specialists")
+    status = await _run_specialists(
+        request,
+        incoming,
+        failed,
+        first_pass=True,
+        rounds=MAX_AGREEMENT_ROUNDS,
+        s1_extra=SPECIALIST_REBUTTAL,
+        s2_extra=SPECIALIST_REBUTTAL,
+        last_round_hint=_last_round_hint("debate"),
     )
-    if executor_ok:
-        _, evaluator_ok = await _run_turn(
-            evaluator, request, incoming, failed, EVALUATOR_FIRST
-        )
-        if evaluator_ok:
-            agreed = await _agreement_rounds(
-                request,
-                incoming,
-                failed,
-                rounds=MAX_AGREEMENT_ROUNDS,
-                executor_extra=EXECUTOR_REBUTTAL,
-                evaluator_extra=EVALUATOR_REBUTTAL,
-                last_round_hint=(
-                    "\nThis is the last debate round. Do not fake consensus. "
-                    "If you cannot independently agree, keep AGREEMENT: no.\n"
-                ),
-            )
-
-    if not failed and agreed:
-        await _send_to_technical(
-            request, incoming, failed, TECHNICAL_AFTER_AGREEMENT
-        )
-    return failed, agreed
+    if status == "ask_user":
+        if not failed:
+            await _prompt_for_user_input(request, incoming, failed)
+        return failed, "failed" if failed else "ask_user"
+    if status != "agreed":
+        return failed, status
+    status = await _continue_pipeline(
+        request, incoming, failed, from_stage="evaluator"
+    )
+    return failed, status
 
 
 async def _directed_turns(
     request: str, incoming: IncomingFiles, notes: dict[str, str]
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], str]:
     """Only the teammates the user named speak this turn."""
     failed: list[str] = []
     named = {name for name in notes if name in EMPLOYEE_NAMES}
-    wants_agreement = "Executor" in named and "Evaluator" in named
-    replies = {"Executor": "", "Evaluator": ""}
+    wants_agreement = "Specialist 1" in named and "Specialist 2" in named
+    replies = {"Specialist 1": "", "Specialist 2": ""}
     for employee in TEAM:
         if employee.name not in named:
             continue
@@ -825,58 +1227,90 @@ async def _directed_turns(
         if employee.name in replies:
             replies[employee.name] = reply
 
+    if wants_agreement and not failed and _both_ask_user(
+        replies["Specialist 1"], replies["Specialist 2"]
+    ):
+        await _prompt_for_user_input(request, incoming, failed)
+        return failed, "failed" if failed else "ask_user"
+
     agreed = wants_agreement and not failed and _both_agree(
-        replies["Executor"], replies["Evaluator"]
+        replies["Specialist 1"], replies["Specialist 2"]
     )
-    if agreed and "Technical" not in named:
-        await _send_to_technical(
-            request, incoming, failed, TECHNICAL_AFTER_AGREEMENT
+    others = named - set(SPECIALIST_NAMES)
+    if agreed and not others:
+        status = await _continue_pipeline(
+            request, incoming, failed, from_stage="evaluator"
         )
-    return failed, agreed
+        return failed, status
+    if agreed:
+        return failed, "agreed"
+    return failed, "stalled" if wants_agreement else "agreed"
+
+
+def _phase() -> str:
+    return cl.user_session.get(PHASE_KEY) or "specialists"
+
+
+def _phase_from_checkin(text: str) -> str:
+    for phase, needle in _ADVANCE_PHRASES.items():
+        if needle in (text or ""):
+            return phase
+    return "specialists"
 
 
 def _checkin_text() -> str:
     n = MAX_AGREEMENT_ROUNDS
+    phase = _phase()
+    if phase == "evaluator":
+        who = f"Evaluator {_CHECKIN_MARKER}"
+        skip = "Executor"
+    elif phase == "executor":
+        who = f"Executor {_CHECKIN_MARKER}"
+        skip = "Technical"
+    else:
+        who = f"Specialist 1 and Specialist 2 {_CHECKIN_MARKER}"
+        skip = "Evaluator"
+    advance = _advance_label(phase)
     return (
         f"{_nameplate('Front desk')}"
-        f"Executor and Evaluator {_CHECKIN_MARKER} {n} attempts, so I have not "
-        "sent this to Technical.\n\n"
+        f"{who} {n} attempts, so I have not "
+        f"{_ADVANCE_PHRASES[phase]}.\n\n"
         "How do you want to proceed?\n"
-        "- **Keep arguing** — they continue until they can both stand behind a plan.\n"
+        "- **Keep arguing** — they continue until they can stand behind a plan.\n"
         "- **Lower the bar a little** — they converge on the version they already "
         "share the most, dropping remaining non-deal-breaker disagreements.\n"
-        "- **Send to Technical** — Technical takes the current plan as-is and treats "
-        "leftover disagreements as risks.\n\n"
+        f"- **{advance}** — send the current plan to {skip} and keep going.\n\n"
         "Click a button, or reply in chat. You can also instruct someone by name, "
         "for example:\n"
-        "- `Evaluator, drop the multi-region requirement`\n"
-        "- `Executor, keep SQLite. Evaluator, that is acceptable.`\n"
+        "- `Specialist 1, drop the multi-region requirement`\n"
+        "- `Evaluator, that SQLite choice is acceptable.`\n"
         "- `@Technical implement the overlap they already have`"
     )
 
 
 def _checkin_actions() -> list:
+    labels = _choice_labels(_phase())
     return [
         cl.Action(
             name="agreement_choice",
             payload={"choice": "continue"},
-            label="Keep arguing",
+            label=labels["continue"],
             icon="messages-square",
             tooltip="They keep debating toward independent agreement.",
         ),
         cl.Action(
             name="agreement_choice",
             payload={"choice": "compromise"},
-            label="Lower the bar a little",
+            label=labels["compromise"],
             icon="scale",
             tooltip="Ship the most agreed-upon version.",
         ),
         cl.Action(
             name="agreement_choice",
-            payload={"choice": "technical"},
-            label="Send to Technical",
+            payload={"choice": "advance"},
+            label=labels["advance"],
             icon="hammer",
-            tooltip="Take what they have and hand it to Technical.",
+            tooltip=f"Take what they have and {_advance_label(_phase()).lower()}.",
         ),
     ]
 
@@ -884,6 +1318,10 @@ def _checkin_actions() -> list:
 def _is_checkin_text(content: str) -> bool:
     text = content or ""
     return _CHECKIN_MARKER in text and "How do you want to proceed?" in text
+
+
+def _is_question_wait(content: str) -> bool:
+    return _QUESTION_MARKER in (content or "")
 
 
 async def _ask_how_to_proceed() -> None:
@@ -917,15 +1355,26 @@ async def _announce_failures(failed: list[str]) -> None:
     ).send()
 
 
-async def _wrap_up(failed: list[str], agreed: bool, *, check_in: bool) -> None:
+async def _wrap_up(failed: list[str], status: str, *, check_in: bool) -> None:
     if failed:
         await _announce_failures(failed)
         return
-    if agreed:
+    if status == "ask_user":
+        return
+    if status == "agreed":
         cl.user_session.set(STALLED_KEY, False)
+        cl.user_session.set(PHASE_KEY, None)
         return
     if check_in:
         await _ask_how_to_proceed()
+
+
+def _debate_pair_label(phase: str) -> str:
+    if phase == "evaluator":
+        return "Evaluator and the specialists"
+    if phase == "executor":
+        return "Executor and the specialists"
+    return "Specialist 1 and Specialist 2"
 
 
 async def _handle_agreement_decision(
@@ -935,7 +1384,8 @@ async def _handle_agreement_decision(
     choice: Optional[str] = None,
 ) -> None:
     notes = parse_named_instructions(request)
-    parsed = parse_agreement_choice(request)
+    phase = _phase()
+    parsed = parse_agreement_choice(request, phase)
     explicit_path = choice is not None or parsed is not None
     if choice is None:
         choice = parsed
@@ -943,18 +1393,19 @@ async def _handle_agreement_decision(
         choice = "technical" if list(notes) == ["Technical"] else "continue"
         explicit_path = list(notes) == ["Technical"]
 
+    labels = _choice_labels(phase)
     named_steer = bool(notes) and choice == "continue" and not explicit_path
     if named_steer:
         recipients = [name for name in notes if name != "Technical"]
         who = ", ".join(recipients) or "the team"
         ack = (
-            f"{_nameplate('Front desk')}I'll pass that to {who} and have Executor and "
-            "Evaluator take another pass."
+            f"{_nameplate('Front desk')}I'll pass that to {who} and have "
+            f"{_debate_pair_label(phase)} take another pass."
         )
         if "Technical" in notes:
             ack += " I'll hold Technical until they finish."
     else:
-        label = CHOICE_LABELS[choice]
+        label = labels.get(choice, "Send to Technical")
         ack = f"{_nameplate('Front desk')}Got it — {label.lower()}."
         recipients = [
             name for name in notes if choice == "technical" or name != "Technical"
@@ -962,7 +1413,7 @@ async def _handle_agreement_decision(
         if recipients:
             ack += f" I'll also pass your instruction to {', '.join(recipients)}."
         if choice != "technical" and "Technical" in notes:
-            ack += " I'll hold Technical until Executor and Evaluator finish."
+            ack += f" I'll hold Technical until {_debate_pair_label(phase)} finish."
     _remember("Front desk", ack)
     await _bubble("Front desk", ack).send()
 
@@ -983,54 +1434,105 @@ async def _handle_agreement_decision(
             tech_brief = _user_note_brief("Technical", notes["Technical"]) + tech_brief
         if not failed:
             await _send_to_technical(request, incoming, failed, tech_brief)
-        await _wrap_up(failed, True, check_in=False)
+        await _wrap_up(failed, "agreed" if not failed else "failed", check_in=False)
         return
 
-    if choice == "compromise":
-        executor_extra = COMPROMISE_EXECUTOR
-        evaluator_extra = COMPROMISE_EVALUATOR
-        rounds = max(1, min(2, MAX_AGREEMENT_ROUNDS))
-        last_hint = (
-            "\nThis is the last compromise round. Agree if you can stand behind the "
-            "most-shared plan; keep AGREEMENT: no if it is still wrong or off-goal.\n"
+    if choice == "advance":
+        next_stage = {
+            "specialists": "evaluator",
+            "evaluator": "executor",
+            "executor": "technical",
+        }.get(phase, "evaluator")
+        status = await _continue_pipeline(
+            request, incoming, failed, from_stage=next_stage, forced=True
         )
-    else:
-        executor_extra = EXECUTOR_REBUTTAL + CONTINUE_HINT
-        evaluator_extra = EVALUATOR_REBUTTAL + CONTINUE_HINT
-        rounds = 1 if named_steer else MAX_AGREEMENT_ROUNDS
-        last_hint = (
-            "\nThis is the last debate round. Do not fake consensus. "
-            "If you cannot independently agree, keep AGREEMENT: no.\n"
+        await _wrap_up(failed, status, check_in=status == "stalled")
+        return
+
+    compromise = choice == "compromise"
+    last_hint = _last_round_hint("compromise" if compromise else "debate")
+    if phase == "specialists":
+        s1_extra = COMPROMISE_SPECIALIST if compromise else SPECIALIST_REBUTTAL + CONTINUE_HINT
+        s2_extra = COMPROMISE_SPECIALIST if compromise else SPECIALIST_REBUTTAL + CONTINUE_HINT
+        s1_extra = _with_note("Specialist 1", s1_extra, notes)
+        s2_extra = _with_note("Specialist 2", s2_extra, notes)
+        lead = None
+        if "Specialist 2" in notes and "Specialist 1" not in notes:
+            lead = "Specialist 2"
+        elif "Specialist 1" in notes and "Specialist 2" not in notes:
+            lead = "Specialist 1"
+        rounds = 1 if named_steer else (
+            max(1, min(2, MAX_AGREEMENT_ROUNDS)) if compromise else MAX_AGREEMENT_ROUNDS
         )
-
-    if notes.get("Executor"):
-        executor_extra = _user_note_brief("Executor", notes["Executor"]) + executor_extra
-    if notes.get("Evaluator"):
-        evaluator_extra = (
-            _user_note_brief("Evaluator", notes["Evaluator"]) + evaluator_extra
+        status = await _specialist_rounds(
+            request,
+            incoming,
+            failed,
+            rounds=rounds,
+            s1_extra=s1_extra,
+            s2_extra=s2_extra,
+            lead=lead,
+            last_round_hint=last_hint,
         )
+        if status == "ask_user" and not failed:
+            await _prompt_for_user_input(request, incoming, failed)
+        elif status == "agreed" and not failed:
+            status = await _continue_pipeline(
+                request, incoming, failed, from_stage="evaluator"
+            )
+        await _wrap_up(failed, status, check_in=status == "stalled")
+        return
 
-    lead = None
-    if "Evaluator" in notes and "Executor" not in notes:
-        lead = "Evaluator"
-    elif "Executor" in notes and "Evaluator" not in notes:
-        lead = "Executor"
-
-    agreed = await _agreement_rounds(
+    next_stage = "evaluator" if phase == "evaluator" else "executor"
+    status = await _continue_pipeline(
         request,
         incoming,
         failed,
-        rounds=rounds,
-        executor_extra=executor_extra,
-        evaluator_extra=evaluator_extra,
-        lead=lead,
-        last_round_hint=last_hint,
+        from_stage=next_stage,
+        forced=False,
+        compromise=compromise,
     )
-    if not failed and agreed:
-        await _send_to_technical(
-            request, incoming, failed, TECHNICAL_AFTER_AGREEMENT
+    await _wrap_up(failed, status, check_in=status == "stalled")
+
+
+async def _resume_after_user_input(
+    request: str, incoming: IncomingFiles
+) -> None:
+    cl.user_session.set(PENDING_QUESTION_KEY, False)
+    notes = parse_named_instructions(request)
+    parsed = parse_agreement_choice(request, "specialists")
+    if parsed == "technical" or list(notes) == ["Technical"]:
+        await _handle_agreement_decision(request, incoming, choice="technical")
+        return
+
+    ack = (
+        f"{_nameplate('Front desk')}Got it — I'll give that to the specialists "
+        "so they can keep planning."
+    )
+    _remember("Front desk", ack)
+    await _bubble("Front desk", ack).send()
+
+    failed: list[str] = []
+    cl.user_session.set(PHASE_KEY, "specialists")
+    s1_extra = _with_note("Specialist 1", SPECIALIST_AFTER_USER, notes)
+    s2_extra = _with_note("Specialist 2", SPECIALIST_AFTER_USER, notes)
+    status = await _run_specialists(
+        request,
+        incoming,
+        failed,
+        first_pass=False,
+        rounds=MAX_AGREEMENT_ROUNDS,
+        s1_extra=s1_extra,
+        s2_extra=s2_extra,
+        last_round_hint=_last_round_hint("debate"),
+    )
+    if status == "ask_user" and not failed:
+        await _prompt_for_user_input(request, incoming, failed)
+    elif status == "agreed" and not failed:
+        status = await _continue_pipeline(
+            request, incoming, failed, from_stage="evaluator"
         )
-    await _wrap_up(failed, agreed, check_in=True)
+    await _wrap_up(failed, status, check_in=status == "stalled")
 
 
 async def _name_thread(user_text: str) -> None:
@@ -1078,18 +1580,24 @@ def auth_callback(username: str, password: str) -> Optional[cl.User]:
 def _welcome_lines() -> list[str]:
     lines = [
         _nameplate("Front desk")
-        + "You're in a group chat with three AI teammates. Each one writes its own "
+        + "You're in a group chat with five AI teammates. Each one writes its own "
         "message, live:",
-        f"- **Executor** (`{EXECUTOR_MODEL}`) — researches the plan from official company "
-        "and OEM sources (Reddit only when replies confirmed success)",
-        f"- **Evaluator** (`{EVALUATOR_MODEL}`) — project manager: audits the whole thread, "
-        "fact-checks hard, and keeps the work on your larger goal",
-        f"- They argue up to {MAX_AGREEMENT_ROUNDS} times. If they still don't independently "
-        "agree, I check in with you before Technical starts.",
-        f"- **Technical** (`{TECHNICAL_MODEL}`) — technical deployment plan, and does the "
-        "work if you asked for action",
+        f"- **Specialist 1** (`{SPECIALIST_1_MODEL}`) — lead planner: researches "
+        "the plan from official sources, questions Specialist 2, and is the only "
+        "specialist who asks you questions",
+        f"- **Specialist 2** (`{SPECIALIST_2_MODEL}`) — planning partner: same "
+        "executor craft, challenges and fact-checks Specialist 1. They only ping "
+        "you when both agree they need your input",
+        f"- They argue up to {MAX_AGREEMENT_ROUNDS} times. If they still don't "
+        "independently agree, I check in with you before Evaluator starts.",
+        f"- **Evaluator** (`{EVALUATOR_MODEL}`) — fact-checks the specialists' "
+        "plan, assumes mistakes, and fixes major issues",
+        f"- **Executor** (`{EXECUTOR_MODEL}`) — project manager: validation, "
+        "accuracy, and keeping this chat aligned so nothing hallucinated slips through",
+        f"- **Technical** (`{TECHNICAL_MODEL}`) — codes and builds what the "
+        "signed-off plan asks for",
         "",
-        "Address someone by name to instruct just them, e.g. `Executor, drop Kubernetes` "
+        "Address someone by name to instruct just them, e.g. `Specialist 1, drop Kubernetes` "
         "or `@Evaluator you're too strict on tests`.",
         "Attach images or spreadsheets with the paperclip. The team can send files back too.",
         f"_Build {APP_BUILD}_",
@@ -1116,6 +1624,8 @@ async def on_chat_start():
     cl.user_session.set(TRANSCRIPT_KEY, [])
     cl.user_session.set("thread_named", False)
     cl.user_session.set(PENDING_KEY, False)
+    cl.user_session.set(PENDING_QUESTION_KEY, False)
+    cl.user_session.set(PHASE_KEY, None)
     cl.user_session.set(CHECKIN_MSG_KEY, None)
     cl.user_session.set(BUSY_KEY, False)
     cl.user_session.set(STALLED_KEY, False)
@@ -1142,11 +1652,13 @@ async def on_chat_resume(thread):
         elif speaker in roles or speaker in {"Front desk", "Chat moderator"}:
             history.append(f"{speaker}: {content[:MAX_ENTRY_CHARS]}")
     cl.user_session.set(TRANSCRIPT_KEY, history[-MAX_TRANSCRIPT_ENTRIES:])
-    pending = bool(history) and history[-1].startswith("Front desk:") and _is_checkin_text(
-        history[-1]
-    )
+    last = history[-1] if history else ""
+    pending = bool(history) and last.startswith("Front desk:") and _is_checkin_text(last)
+    waiting = bool(history) and last.startswith("Front desk:") and _is_question_wait(last)
     cl.user_session.set(PENDING_KEY, pending)
+    cl.user_session.set(PENDING_QUESTION_KEY, waiting and not pending)
     cl.user_session.set(STALLED_KEY, pending)
+    cl.user_session.set(PHASE_KEY, _phase_from_checkin(last) if pending else None)
 
 
 async def _busy_guard() -> bool:
@@ -1163,6 +1675,10 @@ async def _busy_guard() -> bool:
 async def _run_user_request(request: str, incoming: IncomingFiles) -> None:
     cl.user_session.set(BUSY_KEY, True)
     try:
+        if cl.user_session.get(PENDING_QUESTION_KEY):
+            await _resume_after_user_input(request, incoming)
+            return
+
         if cl.user_session.get(PENDING_KEY):
             await _dismiss_checkin()
             await _handle_agreement_decision(request, incoming)
@@ -1170,16 +1686,18 @@ async def _run_user_request(request: str, incoming: IncomingFiles) -> None:
 
         notes = parse_named_instructions(request)
         if notes:
-            failed, agreed = await _directed_turns(request, incoming, notes)
+            failed, status = await _directed_turns(request, incoming, notes)
             stalled = bool(cl.user_session.get(STALLED_KEY))
-            both_named = "Executor" in notes and "Evaluator" in notes
+            both_named = "Specialist 1" in notes and "Specialist 2" in notes
             await _wrap_up(
-                failed, agreed, check_in=stalled and both_named and not agreed
+                failed,
+                status,
+                check_in=stalled and both_named and status == "stalled",
             )
             return
 
-        failed, agreed = await _collaborate(request, incoming)
-        await _wrap_up(failed, agreed, check_in=not agreed)
+        failed, status = await _collaborate(request, incoming)
+        await _wrap_up(failed, status, check_in=status == "stalled")
     finally:
         cl.user_session.set(BUSY_KEY, False)
 
@@ -1199,9 +1717,9 @@ async def on_agreement_choice(action: cl.Action):
     if not cl.user_session.get(PENDING_KEY):
         return
     choice = (action.payload or {}).get("choice")
-    if choice not in CHOICE_LABELS:
+    if choice not in _choice_labels(_phase()):
         return
-    label = CHOICE_LABELS[choice]
+    label = _choice_labels(_phase())[choice]
     _remember("You", label)
     incoming = IncomingFiles(prompt_block="", summary="")
     cl.user_session.set(BUSY_KEY, True)

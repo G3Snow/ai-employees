@@ -20,7 +20,7 @@ max_size_mb = 12
 
 [UI]
 name = "AI Team"
-description = "Executor, Evaluator, and Technical — agree before they deploy"
+description = "Specialists plan, Evaluator fact-checks, Executor signs off, Technical builds"
 default_theme = "dark"
 default_sidebar_state = "open"
 cot = "hidden"
