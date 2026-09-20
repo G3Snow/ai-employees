@@ -49,10 +49,13 @@ VISION_MARKERS = (
     "gpt-4o",
     "gpt-4.1",
     "gpt-5",
+    "gpt-6",
     "claude-3",
     "claude-4",
     "claude-sonnet",
     "claude-opus",
+    "claude-fable",
+    "claude-mythos",
     "claude-haiku",
     "gemini",
 )
@@ -234,6 +237,7 @@ class FileWorkspace:
 
 def employee_tools(workspace: FileWorkspace):
     from crewai.tools import tool
+    from research import research_tools
 
     @tool("write_text_file")
     def write_text_file(filename: str, content: str) -> str:
@@ -264,7 +268,7 @@ def employee_tools(workspace: FileWorkspace):
         path = workspace.write(name, buffer.getvalue())
         return f"Saved `{path.name}` with {rows} rows. It will be attached to your chat message."
 
-    return [write_text_file, write_spreadsheet]
+    return [write_text_file, write_spreadsheet, *research_tools()]
 
 
 def chainlit_elements(paths: list[Path]) -> list:

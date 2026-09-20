@@ -7,3 +7,4 @@ aiosqlite>=0.20.0
 greenlet>=3.0.0
 aiofiles>=23.0.0
 openpyxl>=3.1.5
+ddgs>=9.0.0

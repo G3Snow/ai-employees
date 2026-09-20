@@ -20,7 +20,7 @@ max_size_mb = 12
 
 [UI]
 name = "AI Team"
-description = "Group chat with Executor, Evaluator, and Technical"
+description = "Executor, Evaluator, and Technical — agree before they deploy"
 default_theme = "dark"
 default_sidebar_state = "open"
 cot = "hidden"
