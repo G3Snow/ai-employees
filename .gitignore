@@ -1,5 +1,6 @@
 .env
 .venv/
+.venv312/
 __pycache__/
 .chainlit/*
 !.chainlit/config.toml

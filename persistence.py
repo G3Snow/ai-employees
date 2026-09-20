@@ -1,3 +1,7 @@
+"""Storage bootstrap for chat history: schema plus a stable auth secret."""
+
+import asyncio
+import logging
 import os
 import secrets
 from pathlib import Path
@@ -6,22 +10,13 @@ from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+logger = logging.getLogger("aiEmployees.persistence")
+
 DATA_DIR = Path(__file__).resolve().parent / "data"
 SQLITE_PATH = DATA_DIR / "chainlit.db"
 AUTH_SECRET_FILE = DATA_DIR / "auth_secret"
-
-
-def configure_runtime() -> None:
-    load_dotenv()
-    if os.getenv("CHAINLIT_AUTH_SECRET"):
-        return
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if AUTH_SECRET_FILE.exists():
-        secret = AUTH_SECRET_FILE.read_text(encoding="utf-8").strip()
-    else:
-        secret = secrets.token_urlsafe(48)
-        AUTH_SECRET_FILE.write_text(secret, encoding="utf-8")
-    os.environ["CHAINLIT_AUTH_SECRET"] = secret
+AUTH_SECRET_KEY = "chainlit_auth_secret"
+BOOTSTRAP_TIMEOUT_SECONDS = 20
 
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -93,6 +88,11 @@ CREATE TABLE IF NOT EXISTS feedbacks (
     "value" INT NOT NULL,
     "comment" TEXT,
     FOREIGN KEY ("threadId") REFERENCES threads("id") ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    "key" TEXT PRIMARY KEY,
+    "value" TEXT NOT NULL
 );
 """
 
@@ -167,16 +167,21 @@ CREATE TABLE IF NOT EXISTS feedbacks (
     "comment" TEXT,
     FOREIGN KEY ("threadId") REFERENCES threads("id") ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    "key" TEXT PRIMARY KEY,
+    "value" TEXT NOT NULL
+);
 """
 
 
 def database_url() -> str:
+    """Async SQLAlchemy URL. Falls back to a local sqlite file."""
     raw = os.getenv("DATABASE_URL", "").strip()
     if raw:
-        if raw.startswith("postgres://"):
-            raw = "postgresql+asyncpg://" + raw[len("postgres://") :]
-        elif raw.startswith("postgresql://"):
-            raw = "postgresql+asyncpg://" + raw[len("postgresql://") :]
+        for prefix in ("postgresql+asyncpg://", "postgres://", "postgresql://"):
+            if raw.startswith(prefix):
+                return "postgresql+asyncpg://" + raw[len(prefix) :]
         return raw
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return f"sqlite+aiosqlite:///{SQLITE_PATH}"
@@ -186,16 +191,70 @@ def uses_postgres() -> bool:
     return database_url().startswith("postgresql+asyncpg://")
 
 
-async def ensure_schema() -> None:
-    url = database_url()
-    connect_args = {}
-    if uses_postgres():
-        connect_args["ssl"] = True
-    engine = create_async_engine(url, connect_args=connect_args)
+def history_is_durable() -> bool:
+    """Sqlite lives on an ephemeral disk, so only Postgres survives a restart."""
+    return uses_postgres()
+
+
+def postgres_ssl_required() -> bool:
+    mode = os.getenv("DATABASE_SSL", "auto").strip().lower()
+    if mode in {"off", "false", "0", "disable"}:
+        return False
+    if mode in {"on", "true", "1", "require"}:
+        return True
+    return uses_postgres()
+
+
+def connect_args() -> dict:
+    return {"ssl": True} if uses_postgres() and postgres_ssl_required() else {}
+
+
+async def _prepare_storage() -> str:
+    engine = create_async_engine(database_url(), connect_args=connect_args())
     schema = POSTGRES_SCHEMA if uses_postgres() else SQLITE_SCHEMA
-    async with engine.begin() as conn:
-        for statement in schema.split(";"):
-            stmt = statement.strip()
-            if stmt:
-                await conn.execute(text(stmt))
-    await engine.dispose()
+    try:
+        async with engine.begin() as conn:
+            for statement in schema.split(";"):
+                if statement.strip():
+                    await conn.execute(text(statement))
+            await conn.execute(
+                text(
+                    'INSERT INTO app_settings ("key", "value") VALUES (:key, :value) '
+                    'ON CONFLICT ("key") DO NOTHING'
+                ),
+                {"key": AUTH_SECRET_KEY, "value": secrets.token_urlsafe(48)},
+            )
+            stored = await conn.execute(
+                text('SELECT "value" FROM app_settings WHERE "key" = :key'),
+                {"key": AUTH_SECRET_KEY},
+            )
+            return stored.scalar_one()
+    finally:
+        await engine.dispose()
+
+
+def _file_secret() -> str:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if AUTH_SECRET_FILE.exists():
+        existing = AUTH_SECRET_FILE.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    secret = secrets.token_urlsafe(48)
+    AUTH_SECRET_FILE.write_text(secret, encoding="utf-8")
+    return secret
+
+
+def bootstrap() -> None:
+    """Create the history tables and pin an auth secret before Chainlit loads."""
+    load_dotenv()
+    try:
+        secret = asyncio.run(
+            asyncio.wait_for(_prepare_storage(), timeout=BOOTSTRAP_TIMEOUT_SECONDS)
+        )
+    except Exception as exc:
+        logger.warning("Storage bootstrap failed (%s); chat history may not persist.", exc)
+        secret = None
+
+    if not os.getenv("CHAINLIT_AUTH_SECRET"):
+        # Reusing one secret keeps people logged in across restarts and deploys.
+        os.environ["CHAINLIT_AUTH_SECRET"] = secret or _file_secret()

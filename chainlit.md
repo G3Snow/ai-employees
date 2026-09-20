@@ -1,5 +1,6 @@
 # AI Team
 
-Chat with Executor, Evaluator, and Technical as a group. Each person posts their own message.
+Executor, Evaluator, and Technical answer together in one group chat. Each one writes
+its own message as it goes, so you can read the conversation while it happens.
 
-Open **past chats** from the left sidebar after you sign in.
+Your past chats are saved in the left sidebar. Open one to pick it back up.
