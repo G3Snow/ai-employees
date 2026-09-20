@@ -31,7 +31,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-4"
+APP_BUILD = "group-chat-5"
 
 EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-4o")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-3-5-sonnet-20240620")

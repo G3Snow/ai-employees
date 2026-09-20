@@ -3,6 +3,9 @@
 allow_origins = ["*"]
 session_timeout = 3600
 user_session_timeout = 1296000
+# Render (and most load balancers) can split polling and uploads across
+# processes; websocket-only keeps the chat session on one connection.
+transports = ["websocket"]
 
 [features]
 unsafe_allow_html = false
@@ -22,6 +25,7 @@ default_theme = "dark"
 default_sidebar_state = "open"
 cot = "hidden"
 custom_css = "/public/theme.css"
+custom_js = "/public/upload_session.js"
 logo_file_url = "/public/logo_dark.png"
 default_avatar_file_url = "/public/favicon.png"
 login_page_image = "/public/login_bg.png"
