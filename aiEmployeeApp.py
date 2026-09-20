@@ -14,6 +14,13 @@ from persistence import (
     history_is_durable,
     storage_error,
 )
+from files import (
+    FileWorkspace,
+    IncomingFiles,
+    chainlit_elements,
+    employee_tools,
+    ingest,
+)
 
 # Must run before Chainlit is imported: it reads the auth secret at import time.
 bootstrap()
@@ -24,7 +31,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-3"
+APP_BUILD = "group-chat-4"
 
 EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-4o")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-3-5-sonnet-20240620")
@@ -45,6 +52,9 @@ Write one complete chat message now. Never wait for anyone else to speak.
 - If a teammate already assigned roles and you agree, say so in one clause and continue.
 - Fact-check the others using your specialty. Correct mistakes; do not rubber-stamp.
 - Talk like a colleague in chat: concise and practical, no headers for a simple ask.
+- The user may attach images, spreadsheets, and other files. Use them.
+- If a downloadable file would help (spreadsheet, csv, code, notes), create it with
+  write_text_file or write_spreadsheet. It is attached to your message automatically.
 """
 
 
@@ -121,6 +131,14 @@ TEAM = (
 )
 
 
+def _same_secret(left: str, right: str) -> bool:
+    a, b = left.encode("utf-8"), right.encode("utf-8")
+    if len(a) != len(b):
+        hmac.compare_digest(a, a)
+        return False
+    return hmac.compare_digest(a, b)
+
+
 def missing_provider_keys() -> list[str]:
     models = " ".join(employee.model for employee in TEAM)
     missing = []
@@ -141,27 +159,44 @@ def _remember(speaker: str, message: str) -> None:
     cl.user_session.set(TRANSCRIPT_KEY, history)
 
 
-def _build_crew(employee: Employee, user_request: str, stream: bool):
+def _build_crew(
+    employee: Employee,
+    user_request: str,
+    stream: bool,
+    incoming: IncomingFiles,
+    workspace: FileWorkspace,
+):
     from crewai import Agent, Crew, LLM, Process, Task
 
+    tools = employee_tools(workspace)
+    vision = incoming.vision_files(employee.model)
     agent = Agent(
         role=employee.name,
         goal=employee.goal,
         backstory=f"{employee.backstory}\n{COLLABORATION_PROTOCOL}",
         llm=LLM(model=employee.model, stream=stream, timeout=REQUEST_TIMEOUT_SECONDS),
         allow_delegation=False,
-        max_iter=3,
+        max_iter=5,
+        tools=tools,
         verbose=False,
     )
     history = "\n\n".join(_transcript()) or "(nothing yet)"
+    files_block = f"\n\n{incoming.prompt_block}" if incoming.prompt_block else ""
+    if incoming.input_files and not vision:
+        files_block += (
+            "\n(This model cannot view the image pixels; use the description above.)"
+        )
     task = Task(
         description=(
             f"{employee.brief}\n\n"
             f"Newest message from the user:\n{user_request}\n\n"
             f"Group chat so far:\n{history}"
+            f"{files_block}"
         ),
         expected_output="One complete group-chat message containing your role's work.",
         agent=agent,
+        tools=tools,
+        input_files=vision,
     )
     return Crew(
         agents=[agent],
@@ -210,8 +245,16 @@ def _bubble(author: str, content: str) -> cl.Message:
     return message
 
 
-async def _stream_reply(employee: Employee, user_request: str, show) -> str:
-    output = await _build_crew(employee, user_request, stream=True).akickoff()
+async def _stream_reply(
+    employee: Employee,
+    user_request: str,
+    show,
+    incoming: IncomingFiles,
+    workspace: FileWorkspace,
+) -> str:
+    vision = incoming.vision_files(employee.model) or None
+    crew = _build_crew(employee, user_request, True, incoming, workspace)
+    output = await crew.akickoff(input_files=vision)
     if not hasattr(output, "__aiter__"):
         return _result_text(output)
 
@@ -223,32 +266,36 @@ async def _stream_reply(employee: Employee, user_request: str, show) -> str:
                 streamed.append(token)
                 await show(token)
     finally:
-        # An abandoned stream keeps its worker threads; closing it at least stops
-        # this consumer from being resumed against a session that has gone away.
         await output.aclose()
     return _result_text(output) or _strip_scaffolding("".join(streamed))
 
 
-async def _speak(employee: Employee, bubble: cl.Message, user_request: str) -> str:
+async def _speak(
+    employee: Employee,
+    bubble: cl.Message,
+    user_request: str,
+    incoming: IncomingFiles,
+    workspace: FileWorkspace,
+) -> str:
     """Stream one employee's reply into its own chat bubble."""
     started = False
 
     async def show(token: str) -> None:
         nonlocal started
         if not started:
-            # Drop the "is thinking" placeholder the moment real words arrive.
             started = True
             bubble.content = _nameplate(employee.name)
             await bubble.update()
         await bubble.stream_token(token)
 
     try:
-        return await _stream_reply(employee, user_request, show)
+        return await _stream_reply(employee, user_request, show, incoming, workspace)
     except (AttributeError, TypeError) as exc:
-        # A CrewAI release that reshapes the streaming API should cost live typing,
-        # not the answer itself.
         logger.warning("Streaming unavailable (%s); falling back to a single reply.", exc)
-        output = await _build_crew(employee, user_request, stream=False).akickoff()
+        vision = incoming.vision_files(employee.model) or None
+        output = await _build_crew(
+            employee, user_request, False, incoming, workspace
+        ).akickoff(input_files=vision)
         return _result_text(output)
 
 
@@ -270,33 +317,43 @@ def _failure_message(employee: Employee, exc: Exception) -> str:
     return f"I could not finish. {hint}\n\n`{name}: {detail[:400]}`"
 
 
-async def take_turn(employee: Employee, user_request: str) -> tuple[str, bool]:
+async def take_turn(
+    employee: Employee, user_request: str, incoming: IncomingFiles
+) -> tuple[str, bool]:
     bubble = _bubble(employee.name, f"{_nameplate(employee.name)}_{employee.thinking}_")
     await bubble.send()
+    workspace = FileWorkspace()
     try:
-        reply = await asyncio.wait_for(
-            _speak(employee, bubble, user_request), timeout=TURN_TIMEOUT_SECONDS
-        )
-        ok = True
-    except asyncio.TimeoutError:
-        reply = (
-            f"I ran out of time after {TURN_TIMEOUT_SECONDS}s and stopped mid-answer. "
-            "Try a smaller request, or raise TURN_TIMEOUT_SECONDS on the server."
-        )
-        ok = False
-    except asyncio.CancelledError:
-        # The browser went away; writing to its session would raise again.
-        raise
-    except Exception as exc:
-        logger.exception("%s turn failed", employee.name)
-        reply = _failure_message(employee, exc)
-        ok = False
+        try:
+            reply = await asyncio.wait_for(
+                _speak(employee, bubble, user_request, incoming, workspace),
+                timeout=TURN_TIMEOUT_SECONDS,
+            )
+            ok = True
+        except asyncio.TimeoutError:
+            reply = (
+                f"I ran out of time after {TURN_TIMEOUT_SECONDS}s and stopped mid-answer. "
+                "Try a smaller request, or raise TURN_TIMEOUT_SECONDS on the server."
+            )
+            ok = False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("%s turn failed", employee.name)
+            reply = _failure_message(employee, exc)
+            ok = False
 
-    # Replace the streamed draft with the clean final answer.
-    reply = reply.strip() or "(no reply)"
-    bubble.content = _nameplate(employee.name) + reply
-    await bubble.update()
-    return reply, ok
+        reply = reply.strip() or "(no reply)"
+        attachments = chainlit_elements(workspace.created)
+        if attachments:
+            names = ", ".join(path.name for path in workspace.created)
+            reply = f"{reply}\n\nAttached: {names}"
+            bubble.elements = attachments
+        bubble.content = _nameplate(employee.name) + reply
+        await bubble.update()
+        return reply, ok
+    finally:
+        workspace.close()
 
 
 async def _name_thread(user_text: str) -> None:
@@ -333,7 +390,7 @@ def auth_callback(username: str, password: str) -> Optional[cl.User]:
     expected_user = os.getenv("CHAINLIT_USERNAME", "").strip()
     expected_pass = os.getenv("CHAINLIT_PASSWORD", "")
     if expected_pass:
-        matches = hmac.compare_digest(username, expected_user or username) and hmac.compare_digest(
+        matches = _same_secret(username, expected_user or username) and _same_secret(
             password, expected_pass
         )
         if not matches:
@@ -354,7 +411,7 @@ async def on_chat_start():
         f"- **Evaluator** (`{EVALUATOR_MODEL}`) — what breaks, and whether you can do it",
         f"- **Technical** (`{TECHNICAL_MODEL}`) — stack, corrections, final plan",
         "",
-        "Your past chats are in the left sidebar. Open one to continue it.",
+        "Attach images or spreadsheets with the paperclip. The team can send files back too.",
         f"_Build {APP_BUILD}_",
     ]
     if missing := missing_provider_keys():
@@ -405,27 +462,33 @@ async def on_message(message: cl.Message):
         ).send()
         return
 
-    await _name_thread(message.content)
-    _remember("You", message.content)
+    request = (message.content or "").strip() or "Please review the attached files."
+    stash = FileWorkspace()
+    try:
+        incoming = ingest(list(message.elements or []), stash.uploads)
+        title_source = (message.content or "").strip() or incoming.summary or request
+        await _name_thread(title_source)
+        _remember("You", request + (f"\n[{incoming.summary}]" if incoming.summary else ""))
 
-    failed: list[str] = []
-    for employee in TEAM:
-        reply, ok = await take_turn(employee, message.content)
-        if ok:
-            _remember(employee.name, reply)
-        else:
-            # The rest of the team still runs, but it should not treat an error as advice.
-            failed.append(employee.name)
-            _remember(
-                "Chat moderator",
-                f"{employee.name} could not reply this turn. Cover that ground yourself "
-                "and do not refer to its answer.",
-            )
+        failed: list[str] = []
+        for employee in TEAM:
+            reply, ok = await take_turn(employee, request, incoming)
+            if ok:
+                _remember(employee.name, reply)
+            else:
+                failed.append(employee.name)
+                _remember(
+                    "Chat moderator",
+                    f"{employee.name} could not reply this turn. Cover that ground yourself "
+                    "and do not refer to its answer.",
+                )
 
-    if failed:
-        await _bubble(
-            "Front desk",
-            _nameplate("Front desk")
-            + f"{', '.join(failed)} could not reply this turn, so the plan above is "
-            "missing their input. Fix the error shown in their message and send again.",
-        ).send()
+        if failed:
+            await _bubble(
+                "Front desk",
+                _nameplate("Front desk")
+                + f"{', '.join(failed)} could not reply this turn, so the plan above is "
+                "missing their input. Fix the error shown in their message and send again.",
+            ).send()
+    finally:
+        stash.close()

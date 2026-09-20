@@ -1,6 +1,6 @@
 # AI Team
 
-Executor, Evaluator, and Technical answer together in one group chat. Each one writes
-its own message as it goes, so you can read the conversation while it happens.
+Chat with Executor, Evaluator, and Technical. Attach images or spreadsheets with
+the paperclip; they can send files back in the same thread.
 
-Your past chats are saved in the left sidebar. Open one to pick it back up.
+Past chats are in the left sidebar.

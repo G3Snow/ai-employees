@@ -5,7 +5,9 @@
   letter-spacing: 0.01em;
 }
 
-#welcome-screen,
-.watermark {
-  opacity: 0.85;
+/* Hide Chainlit watermark / GitHub promo. */
+.watermark,
+a[href*="github.com/Chainlit"],
+a[href*="chainlit.io"] {
+  display: none !important;
 }

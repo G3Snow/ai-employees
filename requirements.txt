@@ -1,4 +1,4 @@
-crewai[anthropic]>=1.15.0,<2.0.0
+crewai[anthropic,file-processing]>=1.15.0,<2.0.0
 chainlit>=2.12.0,<3.0.0
 python-dotenv>=1.0.0
 SQLAlchemy>=2.0.0
@@ -6,3 +6,4 @@ asyncpg>=0.30.0
 aiosqlite>=0.20.0
 greenlet>=3.0.0
 aiofiles>=23.0.0
+openpyxl>=3.1.5
