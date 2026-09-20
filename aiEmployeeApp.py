@@ -39,7 +39,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-8"
+APP_BUILD = "group-chat-9"
 
 EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-6-astra")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-fable-5-1")
@@ -260,6 +260,17 @@ def _needs_openai_responses(model: str) -> bool:
     return name.startswith("gpt-6") or "astra" in name
 
 
+def _stream_supported(model: str) -> bool:
+    """CrewAI 1.15.x Responses streaming returns '' when the model calls a tool.
+
+    Chat Completions streaming already hands those tool calls back to the agent.
+    The Responses stream path does not, so CrewAI raises
+    ``ValueError: Invalid response from LLM call - None or empty.``
+    Astra can only use tools on Responses, so it cannot stream until that is fixed.
+    """
+    return not _needs_openai_responses(model)
+
+
 def _openai_reasoning_effort() -> str:
     raw = os.getenv("OPENAI_REASONING_EFFORT", _DEFAULT_OPENAI_REASONING_EFFORT)
     effort = (raw or "").strip().lower()
@@ -274,6 +285,8 @@ def _openai_reasoning_effort() -> str:
 
 
 def _llm_kwargs(employee: Employee, stream: bool) -> dict:
+    if not _stream_supported(employee.model):
+        stream = False
     kwargs: dict = dict(
         model=employee.model, stream=stream, timeout=REQUEST_TIMEOUT_SECONDS
     )
@@ -297,6 +310,7 @@ def _build_crew(
 
     tools = employee_tools(workspace)
     vision = incoming.vision_files(employee.model)
+    stream = stream and _stream_supported(employee.model)
     llm_kwargs = _llm_kwargs(employee, stream)
     agent = Agent(
         role=employee.name,
@@ -384,7 +398,14 @@ async def _stream_reply(
     extra_brief: str = "",
 ) -> str:
     vision = incoming.vision_files(employee.model) or None
-    crew = _build_crew(employee, user_request, True, incoming, workspace, extra_brief)
+    crew = _build_crew(
+        employee,
+        user_request,
+        _stream_supported(employee.model),
+        incoming,
+        workspace,
+        extra_brief,
+    )
     output = await crew.akickoff(input_files=vision)
     if not hasattr(output, "__aiter__"):
         return _result_text(output)
@@ -420,11 +441,17 @@ async def _speak(
             await bubble.update()
         await bubble.stream_token(token)
 
+    streamed = _stream_supported(employee.model)
     try:
         return await _stream_reply(
             employee, user_request, show, incoming, workspace, extra_brief
         )
-    except (AttributeError, TypeError) as exc:
+    except (AttributeError, TypeError, ValueError) as exc:
+        empty = isinstance(exc, ValueError) and "None or empty" in str(exc)
+        if isinstance(exc, ValueError) and not empty:
+            raise
+        if not streamed:
+            raise
         logger.warning("Streaming unavailable (%s); falling back to a single reply.", exc)
         vision = incoming.vision_files(employee.model) or None
         output = await _build_crew(
