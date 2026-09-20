@@ -1,13 +1,13 @@
 # AI Team
 
-Chat with Specialist 1, Specialist 2, Evaluator, and Technical.
+Evaluator leads this team and is the only teammate who talks to you.
 
-The specialists research a plan from official sources, question each other, and
-fact-check until they agree. Specialist 1 asks you questions only when both
-specialists agree they need your input. Evaluator is the project manager:
-fact-checks that plan, fixes major issues, and keeps the thread accurate and
-aligned. Once Evaluator signs off, Technical codes and builds what the plan
-asks for.
+Evaluator answers first, asks until your intent is explicit, and translates
+that into a locked brief for Specialist 1 and Specialist 2. The specialists
+research and debate inside that brief. Evaluator then tells you how it will
+audit their work, audits it, and asks you to confirm before Technical starts.
+Technical is a long coding pass — you will not see intermediate steps until it
+finishes.
 
 Attach images or spreadsheets with the paperclip; they can send files back in
 the same thread. Past chats are in the left sidebar.

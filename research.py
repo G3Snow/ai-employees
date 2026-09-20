@@ -270,20 +270,37 @@ def run_fetch(url: str) -> str:
     return note + "\n\n" + _clip(body)
 
 
-def research_tools():
+def research_tools(on_progress=None):
     from crewai.tools import tool
+
+    def emit(message: str) -> None:
+        if not on_progress:
+            return
+        try:
+            on_progress(message)
+        except Exception:
+            logger.debug("progress hook failed", exc_info=True)
 
     @tool("search_web")
     def search_web(query: str) -> str:
         """Search the public web. Prefer official company, OEM, and vendor docs.
         For field reports, search site:reddit.com and only trust threads whose
         replies confirm the approach actually worked. query: search string."""
-        return run_search(query)
+        emit(f"is searching official sources for: {(query or '')[:120]}…")
+        result = run_search(query)
+        emit("is reading search results and deciding which pages to verify…")
+        return result
 
     @tool("fetch_url")
     def fetch_url(url: str) -> str:
         """Fetch a public https page as readable text. Use for official docs,
         OEM pages, and Reddit threads you need to verify. url: full URL."""
-        return run_fetch(url)
+        emit(f"is fetching and reading: {(url or '')[:160]}…")
+        result = run_fetch(url)
+        emit(
+            "is checking that page against the original goal — treating claims "
+            "as unproven until they match…"
+        )
+        return result
 
     return [search_web, fetch_url]

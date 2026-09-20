@@ -20,7 +20,7 @@ max_size_mb = 12
 
 [UI]
 name = "AI Team"
-description = "Specialists plan, Evaluator signs off, Technical builds"
+description = "Evaluator leads: clarify, lock a brief, specialists plan, you confirm before Technical builds"
 default_theme = "dark"
 default_sidebar_state = "open"
 cot = "hidden"

@@ -244,13 +244,22 @@ class FileWorkspace:
         shutil.rmtree(self.root, ignore_errors=True)
 
 
-def employee_tools(workspace: FileWorkspace):
+def employee_tools(workspace: FileWorkspace, on_progress=None):
     from crewai.tools import tool
+
+    def emit(message: str) -> None:
+        if not on_progress:
+            return
+        try:
+            on_progress(message)
+        except Exception:
+            logger.debug("progress hook failed", exc_info=True)
 
     @tool("write_text_file")
     def write_text_file(filename: str, content: str) -> str:
         """Create a downloadable text file for the user (csv, txt, md, json, html, py, sql, svg).
         filename: name with extension. content: full file body."""
+        emit(f"is writing `{filename}`…")
         path = workspace.write(filename, content.encode("utf-8"))
         return f"Saved `{path.name}` ({path.stat().st_size} bytes). It will be attached to your chat message."
 
@@ -259,6 +268,7 @@ def employee_tools(workspace: FileWorkspace):
         """Create an Excel workbook for the user from CSV text.
         filename: should end in .xlsx. csv_content: comma-separated rows, first row headers."""
         name = filename if filename.lower().endswith(".xlsx") else f"{filename}.xlsx"
+        emit(f"is writing spreadsheet `{name}`…")
         from openpyxl import Workbook
 
         book = Workbook()
@@ -276,7 +286,7 @@ def employee_tools(workspace: FileWorkspace):
         path = workspace.write(name, buffer.getvalue())
         return f"Saved `{path.name}` with {rows} rows. It will be attached to your chat message."
 
-    return [write_text_file, write_spreadsheet, *research_tools()]
+    return [write_text_file, write_spreadsheet, *research_tools(on_progress=on_progress)]
 
 
 def chainlit_elements(paths: list[Path]) -> list:
