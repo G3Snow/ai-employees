@@ -1,4 +1,4 @@
-"""A group chat where five AI employees each answer in their own message."""
+"""A group chat where four AI employees each answer in their own message."""
 
 import asyncio
 import hmac
@@ -39,12 +39,11 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-11"
+APP_BUILD = "group-chat-12"
 
 SPECIALIST_1_MODEL = os.getenv("SPECIALIST_1_MODEL", "anthropic/claude-sonnet-4-6")
 SPECIALIST_2_MODEL = os.getenv("SPECIALIST_2_MODEL", "openai/gpt-5.6-terra")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-fable-5-1")
-EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-6-astra")
 TECHNICAL_MODEL = os.getenv("TECHNICAL_MODEL", "anthropic/claude-opus-5")
 TURN_TIMEOUT_SECONDS = int(os.getenv("TURN_TIMEOUT_SECONDS", "900"))
 # Bounds the provider call itself; the turn timeout alone cannot stop one already running.
@@ -74,11 +73,10 @@ EMPLOYEE_NAMES = (
     "Specialist 1",
     "Specialist 2",
     "Evaluator",
-    "Executor",
     "Technical",
 )
 SPECIALIST_NAMES = ("Specialist 1", "Specialist 2")
-_NAME_TOKEN = r"Specialist 1|Specialist 2|Executor|Evaluator|Technical"
+_NAME_TOKEN = r"Specialist 1|Specialist 2|Evaluator|Technical"
 _OPENING_ADDRESS = re.compile(
     rf"^\s*(?:(?:hey|hi|hello|ok|okay|please)\s+)?"
     rf"((?:@?(?:{_NAME_TOKEN}))(?:\s*(?:,|\band\b|&|/)\s*@?(?:{_NAME_TOKEN}))*)"
@@ -95,15 +93,14 @@ _CHECKIN_MARKER = "have not independently agreed after"
 _QUESTION_MARKER = "need your input before they continue"
 _ADVANCE_PHRASES = {
     "specialists": "sent this to Evaluator",
-    "evaluator": "sent this to Executor",
-    "executor": "sent this to Technical",
+    "evaluator": "sent this to Technical",
 }
 
 COLLABORATION_PROTOCOL = """
-You are in a live group chat with the user and four teammates:
+You are in a live group chat with the user and three teammates:
 Specialist 1 (lead planner), Specialist 2 (planning partner),
-Evaluator (fact-checker of the specialists' plan), Executor (project manager:
-validation, accuracy, anti-hallucination), Technical (coding and building).
+Evaluator (project manager: fact-checking, validation, accuracy,
+anti-hallucination), Technical (coding and building).
 Write one complete chat message now. Never wait for anyone else to speak.
 - Open with one short sentence on who should lead this request and why, then do your job.
 - If a teammate already assigned roles and you agree, say so in one clause and continue.
@@ -118,8 +115,8 @@ Write one complete chat message now. Never wait for anyone else to speak.
   later replies in the same thread confirm the approach actually worked.
 - The user may address you by name (`Specialist 1, …` or `@Evaluator`). Follow that
   instruction; it outranks a teammate's last request, but not the user's original goal.
-- Specialists hash out the plan. Evaluator fact-checks it. Executor signs off only
-  when the thread is accurate and still on the user's goal. Technical then builds it.
+- Specialists hash out the plan. Evaluator fact-checks it and signs off only when
+  the thread is accurate and still on the user's goal. Technical then builds it.
 """
 
 AGREEMENT_FOOTER = """
@@ -185,26 +182,32 @@ fact-checking each other and building the detailed plan.
 """ + SPECIALIST_FOOTER
 
 EVALUATOR_FIRST = """
-The specialists have submitted a plan. This is your first review.
+You are the project manager. The specialists have submitted a plan.
 Primary job: read EVERY message in this thread. Catch hallucinations, dropped
 constraints, and drift away from the user's larger project. Independently
 fact-check the specialists' claims with official sources via search_web and
 fetch_url. Do not trust their citations without fetching them. Identify major
 issues and fix them in a revised plan. Keep the feasibility stress-test: what
-breaks, and whether the user can actually do it. AGREEMENT: yes only if the
-plan is factually sound and major issues are fixed.
+breaks, and whether the user can actually do it. Your focus is validation,
+accuracy, and keeping this chat aligned so nothing hallucinated slips through.
+AGREEMENT: yes only if the plan is factually sound, major issues are fixed, and
+it is ready for Technical to build. Do not write code.
 """ + AGREEMENT_FOOTER
 
 EVALUATOR_HANDOFF = """
 The specialists did not fully agree. The user told Front desk to send you what
 they have. Prefer the overlap they already share. Treat remaining disagreements
 as risks. Independently fact-check with official sources. Fix major issues.
+Validate accuracy and keep the work on the user's goal. AGREEMENT: yes only if
+you can stand behind sending this to Technical.
 """ + AGREEMENT_FOOTER
 
 EVALUATOR_REBUTTAL = """
-Continue fact-checking. Re-read the whole thread. Verify the specialists' latest
-fixes with official sources. Identify remaining major issues and fix them.
-AGREEMENT: yes only if you independently accept the revised plan.
+Continue as project manager. Re-read the whole thread. Verify the specialists'
+latest fixes with official sources. Identify remaining major issues and fix
+them. Catch invented facts, dropped constraints, and scope creep.
+AGREEMENT: yes only if you independently accept the revised plan as accurate
+and ready for Technical.
 """ + AGREEMENT_FOOTER
 
 SPECIALIST_AFTER_EVALUATOR = """
@@ -214,37 +217,8 @@ detailed plan intact where it still holds. You two must get this sound enough
 for Evaluator to accept it.
 """ + SPECIALIST_FOOTER
 
-EXECUTOR_REVIEW = """
-You are the project manager. The specialists hashed out a plan and Evaluator
-fact-checked it. Your job is validation, accuracy, and keeping this entire chat
-aligned to the user's goal so nothing hallucinated or drifted slips through.
-Re-read EVERY message. Catch invented facts, dropped constraints, and scope
-creep. Do not rubber-stamp. AGREEMENT: yes only if the thread is accurate,
-internally consistent, and ready for Technical to build. Do not write code.
-""" + AGREEMENT_FOOTER
-
-EXECUTOR_HANDOFF = """
-The prior stage did not fully sign off. The user told Front desk to send you
-what they have. Prefer the overlap already in the thread. Validate accuracy,
-catch hallucinations, and keep the work on the user's goal. Flag leftover
-risks clearly. AGREEMENT: yes only if you can stand behind sending this to
-Technical.
-""" + AGREEMENT_FOOTER
-
-EXECUTOR_REBUTTAL = """
-You are not yet satisfied. Re-read the whole thread. Call out remaining
-accuracy, alignment, or hallucination problems. The specialists will fix them.
-AGREEMENT: yes only when the plan is safe to hand to Technical.
-""" + AGREEMENT_FOOTER
-
-SPECIALIST_AFTER_EXECUTOR = """
-Executor (project manager) is not satisfied. Treat that as a validation fail,
-not a rewrite-from-scratch. Independently check their claims. Fix accuracy,
-alignment, and hallucination issues they confirmed. Keep the plan detailed.
-""" + SPECIALIST_FOOTER
-
 TECHNICAL_AFTER_AGREEMENT = """
-Executor has signed off. Use only the signed-off plan. Your job is to code and
+Evaluator has signed off. Use only the signed-off plan. Your job is to code and
 build what that plan asks for. Work the way a highly skilled engineer would:
 proven production practices, current official docs, nothing experimental (no
 beta APIs, unproven libraries, or clever unpublished tricks). Check platforms,
@@ -267,17 +241,10 @@ most-agreed plan.
 """ + SPECIALIST_FOOTER
 
 COMPROMISE_EVALUATOR = """
-The user asked you to lower the bar a little. Do not rubber-stamp something
-false or off-goal. Do drop remaining non-deal-breaker objections so the version
-you already share the most can proceed. AGREEMENT: yes only if you can stand
-behind that compromise.
-""" + AGREEMENT_FOOTER
-
-COMPROMISE_EXECUTOR = """
-The user asked you to lower the bar a little so work can reach Technical. Keep
-what is already accurate and on-goal. Drop remaining non-deal-breaker
-objections. AGREEMENT: yes only if you can stand behind sending that version
-to Technical.
+The user asked you to lower the bar a little so work can reach Technical. Do not
+rubber-stamp something false or off-goal. Do drop remaining non-deal-breaker
+objections so the version you already share the most can proceed. AGREEMENT: yes
+only if you can stand behind sending that version to Technical.
 """ + AGREEMENT_FOOTER
 
 TECHNICAL_HANDOFF = """
@@ -297,8 +264,7 @@ If they asked for action, carry it out.
 
 ADVANCE_LABELS = {
     "specialists": "Send to Evaluator",
-    "evaluator": "Send to Executor",
-    "executor": "Send to Technical",
+    "evaluator": "Send to Technical",
 }
 
 
@@ -352,7 +318,7 @@ TEAM = (
         model=SPECIALIST_2_MODEL,
         thinking="is challenging the plan…",
         goal=(
-            "Partner with Specialist 1 on the same executor work: research, question, "
+            "Partner with Specialist 1 on the same planning work: research, question, "
             "fact-check, and expand the plan until you both independently agree. "
             "Never ask the user directly; propose questions to Specialist 1."
         ),
@@ -370,50 +336,31 @@ TEAM = (
     Employee(
         name="Evaluator",
         model=EVALUATOR_MODEL,
-        thinking="is auditing the thread…",
+        thinking="is reviewing the plan…",
         goal=(
-            "Fact-check the specialists' plan: assume mistakes, verify with "
-            "official sources, and identify and fix major issues."
+            "Act as overall project manager: fact-check the specialists' plan, "
+            "assume mistakes, identify and fix major issues, validate accuracy, "
+            "keep the whole chat aligned to the user's goal, prevent hallucination, "
+            "and only then release the plan to Technical."
         ),
         backstory=(
-            "You are a skeptical fact-checker, not a rubber stamp. The specialists "
+            "You are the project manager, not a rubber stamp. The specialists "
             "submit a researched plan. You assume they got things wrong. You "
             "independently verify claims with official company, OEM, and vendor "
             "documentation. You catch hallucinations and drift, stress-test "
             "executability (missing steps, false assumptions, scope that is too "
             "big, skills the user may not have, failure points), and fix major "
-            "issues in a revised plan. You are not the project manager; Executor is."
-        ),
-        brief=(
-            "Confirm or correct who should lead in one clause. Audit the whole "
-            "thread. Fact-check the specialists with official sources. Identify "
-            "major issues and fix them. Say whether the plan can actually be "
-            "executed. Give a verdict and a revised plan that stays inside the "
-            "user's larger goal."
-        ),
-    ),
-    Employee(
-        name="Executor",
-        model=EXECUTOR_MODEL,
-        thinking="is validating the thread…",
-        goal=(
-            "Act as overall project manager: validate accuracy, keep the whole "
-            "chat aligned to the user's goal, prevent hallucination, and only "
-            "then release the plan to Technical."
-        ),
-        backstory=(
-            "You are the project manager. You do not draft the plan from scratch "
-            "and you do not write the code. You read the entire thread after the "
-            "specialists and Evaluator have worked, then you check that every "
-            "claim is still true, every user constraint is still present, and "
-            "the team has not drifted or hallucinated. You send work back until "
+            "issues in a revised plan. Your main focus is validation, accuracy, "
+            "and keeping everything in the chat aligned. You send work back until "
             "you would bet on it. When you are satisfied, Technical may build."
         ),
         brief=(
-            "Validate the current plan against the whole thread. Call out "
-            "inaccuracy, hallucination, and project drift. Do not write code. "
-            "Sign off only when the plan is accurate and still serves the user's "
-            "larger goal, so Technical can build it."
+            "Confirm or correct who should lead in one clause. Audit the whole "
+            "thread for hallucinations and project drift. Fact-check the "
+            "specialists with official sources. Identify major issues and fix "
+            "them. Say whether the plan can actually be executed. Sign off only "
+            "when the plan is accurate and still serves the user's larger goal, "
+            "so Technical can build it. Do not write code."
         ),
     ),
     Employee(
@@ -426,7 +373,7 @@ TEAM = (
         ),
         backstory=(
             "You are a highly skilled hands-on engineer. You work from the plan "
-            "Executor signed off. Your main job is coding and building that plan, "
+            "Evaluator signed off. Your main job is coding and building that plan, "
             "not reinventing it. You check whether the proposed stack can actually "
             "do the job, fix incorrect APIs, code, or architecture, and replace "
             "wishful tooling with something that exists and is production-proven. "
@@ -866,12 +813,12 @@ def parse_agreement_choice(text: str, phase: Optional[str] = None) -> Optional[s
         lowered,
         re.S,
     ):
-        if (phase or "specialists") == "executor":
+        if (phase or "specialists") == "evaluator":
             return "advance"
         return "technical"
     if re.search(
-        r"\b((send|give|pass|hand)\b.{0,40}\b(evaluator|executor)\b|"
-        r"send to (the )?(evaluator|executor))\b",
+        r"\b((send|give|pass|hand)\b.{0,40}\bevaluator\b|"
+        r"send to (the )?evaluator)\b",
         lowered,
         re.S,
     ):
@@ -920,7 +867,6 @@ def _directed_brief(employee: Employee, instruction: str, wants_agreement: bool)
         "Specialist 1": SPECIALIST_REBUTTAL,
         "Specialist 2": SPECIALIST_REBUTTAL,
         "Evaluator": EVALUATOR_REBUTTAL,
-        "Executor": EXECUTOR_REBUTTAL,
     }
     return note + extras.get(employee.name, SPECIALIST_REBUTTAL)
 
@@ -1061,7 +1007,7 @@ async def _continue_pipeline(
     forced: bool = False,
     compromise: bool = False,
 ) -> str:
-    """Run Evaluator → Executor → Technical from the given stage inclusive."""
+    """Run Evaluator review, then Technical, from the given stage inclusive."""
     last_hint = _last_round_hint("compromise" if compromise else "debate")
     stalled_here = bool(cl.user_session.get(STALLED_KEY)) and _phase() == from_stage
     if from_stage == "evaluator":
@@ -1083,35 +1029,6 @@ async def _continue_pipeline(
             failed,
             first_extra=eval_first,
             reject_extra=eval_reject,
-            specialist_extra=spec_fix,
-            rounds=MAX_REVIEW_ROUNDS,
-            last_round_hint=last_hint,
-        )
-        if status != "agreed":
-            return status
-        forced = False
-        stalled_here = False
-        from_stage = "executor"
-
-    if from_stage == "executor":
-        cl.user_session.set(PHASE_KEY, "executor")
-        if forced:
-            exec_first = EXECUTOR_HANDOFF
-        elif compromise:
-            exec_first = COMPROMISE_EXECUTOR
-        elif stalled_here:
-            exec_first = EXECUTOR_REBUTTAL + CONTINUE_HINT
-        else:
-            exec_first = EXECUTOR_REVIEW
-        exec_reject = COMPROMISE_EXECUTOR if compromise else EXECUTOR_REBUTTAL
-        spec_fix = COMPROMISE_SPECIALIST if compromise else SPECIALIST_AFTER_EXECUTOR
-        status = await _signoff_rounds(
-            _named("Executor"),
-            request,
-            incoming,
-            failed,
-            first_extra=exec_first,
-            reject_extra=exec_reject,
             specialist_extra=spec_fix,
             rounds=MAX_REVIEW_ROUNDS,
             last_round_hint=last_hint,
@@ -1179,7 +1096,7 @@ async def _run_specialists(
 async def _collaborate(
     request: str, incoming: IncomingFiles
 ) -> tuple[list[str], str]:
-    """Specialists debate, Evaluator fact-checks, Executor signs off, then Technical builds."""
+    """Specialists debate, Evaluator signs off, then Technical builds."""
     failed: list[str] = []
     cl.user_session.set(PHASE_KEY, "specialists")
     status = await _run_specialists(
@@ -1248,12 +1165,18 @@ async def _directed_turns(
 
 
 def _phase() -> str:
-    return cl.user_session.get(PHASE_KEY) or "specialists"
+    phase = cl.user_session.get(PHASE_KEY) or "specialists"
+    if phase == "executor":
+        return "evaluator"
+    return phase
 
 
 def _phase_from_checkin(text: str) -> str:
+    text = text or ""
+    if "sent this to Executor" in text:
+        return "evaluator"
     for phase, needle in _ADVANCE_PHRASES.items():
-        if needle in (text or ""):
+        if needle in text:
             return phase
     return "specialists"
 
@@ -1263,9 +1186,6 @@ def _checkin_text() -> str:
     phase = _phase()
     if phase == "evaluator":
         who = f"Evaluator {_CHECKIN_MARKER}"
-        skip = "Executor"
-    elif phase == "executor":
-        who = f"Executor {_CHECKIN_MARKER}"
         skip = "Technical"
     else:
         who = f"Specialist 1 and Specialist 2 {_CHECKIN_MARKER}"
@@ -1372,8 +1292,6 @@ async def _wrap_up(failed: list[str], status: str, *, check_in: bool) -> None:
 def _debate_pair_label(phase: str) -> str:
     if phase == "evaluator":
         return "Evaluator and the specialists"
-    if phase == "executor":
-        return "Executor and the specialists"
     return "Specialist 1 and Specialist 2"
 
 
@@ -1440,8 +1358,7 @@ async def _handle_agreement_decision(
     if choice == "advance":
         next_stage = {
             "specialists": "evaluator",
-            "evaluator": "executor",
-            "executor": "technical",
+            "evaluator": "technical",
         }.get(phase, "evaluator")
         status = await _continue_pipeline(
             request, incoming, failed, from_stage=next_stage, forced=True
@@ -1483,12 +1400,11 @@ async def _handle_agreement_decision(
         await _wrap_up(failed, status, check_in=status == "stalled")
         return
 
-    next_stage = "evaluator" if phase == "evaluator" else "executor"
     status = await _continue_pipeline(
         request,
         incoming,
         failed,
-        from_stage=next_stage,
+        from_stage="evaluator",
         forced=False,
         compromise=compromise,
     )
@@ -1580,20 +1496,19 @@ def auth_callback(username: str, password: str) -> Optional[cl.User]:
 def _welcome_lines() -> list[str]:
     lines = [
         _nameplate("Front desk")
-        + "You're in a group chat with five AI teammates. Each one writes its own "
+        + "You're in a group chat with four AI teammates. Each one writes its own "
         "message, live:",
         f"- **Specialist 1** (`{SPECIALIST_1_MODEL}`) — lead planner: researches "
         "the plan from official sources, questions Specialist 2, and is the only "
         "specialist who asks you questions",
         f"- **Specialist 2** (`{SPECIALIST_2_MODEL}`) — planning partner: same "
-        "executor craft, challenges and fact-checks Specialist 1. They only ping "
+        "planning craft, challenges and fact-checks Specialist 1. They only ping "
         "you when both agree they need your input",
         f"- They argue up to {MAX_AGREEMENT_ROUNDS} times. If they still don't "
         "independently agree, I check in with you before Evaluator starts.",
-        f"- **Evaluator** (`{EVALUATOR_MODEL}`) — fact-checks the specialists' "
-        "plan, assumes mistakes, and fixes major issues",
-        f"- **Executor** (`{EXECUTOR_MODEL}`) — project manager: validation, "
-        "accuracy, and keeping this chat aligned so nothing hallucinated slips through",
+        f"- **Evaluator** (`{EVALUATOR_MODEL}`) — project manager: fact-checks "
+        "the specialists' plan, assumes mistakes, fixes major issues, and keeps "
+        "this chat aligned so nothing hallucinated slips through",
         f"- **Technical** (`{TECHNICAL_MODEL}`) — codes and builds what the "
         "signed-off plan asks for",
         "",
@@ -1649,7 +1564,7 @@ async def on_chat_resume(thread):
             continue
         if step.get("type") == "user_message":
             history.append(f"You: {content[:MAX_ENTRY_CHARS]}")
-        elif speaker in roles or speaker in {"Front desk", "Chat moderator"}:
+        elif speaker in roles or speaker in {"Front desk", "Chat moderator", "Executor"}:
             history.append(f"{speaker}: {content[:MAX_ENTRY_CHARS]}")
     cl.user_session.set(TRANSCRIPT_KEY, history[-MAX_TRANSCRIPT_ENTRIES:])
     last = history[-1] if history else ""
