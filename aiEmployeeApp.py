@@ -39,7 +39,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-7"
+APP_BUILD = "group-chat-8"
 
 EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-6-astra")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-fable-5-1")
@@ -48,6 +48,11 @@ TURN_TIMEOUT_SECONDS = int(os.getenv("TURN_TIMEOUT_SECONDS", "360"))
 # Bounds the provider call itself; the turn timeout alone cannot stop one already running.
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "240"))
 MAX_AGREEMENT_ROUNDS = max(1, int(os.getenv("MAX_AGREEMENT_ROUNDS", "2")))
+# GPT-6 Astra rejects reasoning_effort="none". Chat Completions also cannot
+# combine its function tools with any other effort, so those models use the
+# Responses API instead. low | medium | high | xhigh | max
+_OPENAI_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_DEFAULT_OPENAI_REASONING_EFFORT = "high"
 
 TRANSCRIPT_KEY = "transcript"
 MAX_TRANSCRIPT_ENTRIES = 50
@@ -241,6 +246,45 @@ def _remember(speaker: str, message: str) -> None:
     cl.user_session.set(TRANSCRIPT_KEY, history)
 
 
+def _model_leaf(model: str) -> str:
+    return model.rsplit("/", 1)[-1].lower()
+
+
+def _needs_openai_responses(model: str) -> bool:
+    """GPT-6 Astra can call tools only on the Responses API.
+
+    CrewAI defaults to Chat Completions. That path gets a 400 for tools +
+    reasoning, then retries with reasoning_effort="none", which Astra rejects.
+    """
+    name = _model_leaf(model)
+    return name.startswith("gpt-6") or "astra" in name
+
+
+def _openai_reasoning_effort() -> str:
+    raw = os.getenv("OPENAI_REASONING_EFFORT", _DEFAULT_OPENAI_REASONING_EFFORT)
+    effort = (raw or "").strip().lower()
+    if effort in _OPENAI_REASONING_EFFORTS:
+        return effort
+    logger.warning(
+        "OPENAI_REASONING_EFFORT=%r is not supported; using %s.",
+        raw,
+        _DEFAULT_OPENAI_REASONING_EFFORT,
+    )
+    return _DEFAULT_OPENAI_REASONING_EFFORT
+
+
+def _llm_kwargs(employee: Employee, stream: bool) -> dict:
+    kwargs: dict = dict(
+        model=employee.model, stream=stream, timeout=REQUEST_TIMEOUT_SECONDS
+    )
+    if employee.model.startswith("anthropic/"):
+        kwargs["max_tokens"] = 8192
+    if _needs_openai_responses(employee.model):
+        kwargs["api"] = "responses"
+        kwargs["reasoning_effort"] = _openai_reasoning_effort()
+    return kwargs
+
+
 def _build_crew(
     employee: Employee,
     user_request: str,
@@ -253,11 +297,7 @@ def _build_crew(
 
     tools = employee_tools(workspace)
     vision = incoming.vision_files(employee.model)
-    llm_kwargs = dict(
-        model=employee.model, stream=stream, timeout=REQUEST_TIMEOUT_SECONDS
-    )
-    if employee.model.startswith("anthropic/"):
-        llm_kwargs["max_tokens"] = 8192
+    llm_kwargs = _llm_kwargs(employee, stream)
     agent = Agent(
         role=employee.name,
         goal=employee.goal,
