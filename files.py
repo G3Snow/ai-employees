@@ -7,11 +7,20 @@ import io
 import logging
 import re
 import shutil
+import sys
 import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+# Chainlit adds this directory to sys.path while loading the app, then pops it.
+# Keep a copy so lazy imports (and CrewAI re-imports) still find local modules.
+_APP_DIR = str(Path(__file__).resolve().parent)
+if sys.path[-1:] != [_APP_DIR]:
+    sys.path.append(_APP_DIR)
+
+from research import research_tools
 
 logger = logging.getLogger("aiEmployees.files")
 
@@ -237,7 +246,6 @@ class FileWorkspace:
 
 def employee_tools(workspace: FileWorkspace):
     from crewai.tools import tool
-    from research import research_tools
 
     @tool("write_text_file")
     def write_text_file(filename: str, content: str) -> str:

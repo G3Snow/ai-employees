@@ -5,8 +5,15 @@ import hmac
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+# Chainlit inserts this directory on sys.path during load, then pops it.
+_APP_DIR = str(Path(__file__).resolve().parent)
+if sys.path[-1:] != [_APP_DIR]:
+    sys.path.append(_APP_DIR)
 
 from persistence import (
     bootstrap,
@@ -32,7 +39,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-6"
+APP_BUILD = "group-chat-7"
 
 EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-6-astra")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-fable-5-1")
@@ -398,7 +405,8 @@ def _failure_message(employee: Employee, exc: Exception) -> str:
         "APITimeoutError": "The provider stopped responding.",
         "BadRequestError": f"The provider rejected the request for `{employee.model}`.",
         "ValueError": f"`{employee.model}` returned an empty response.",
-        "ImportError": f"The server is missing the package for `{employee.model}`.",
+        "ImportError": "The server is missing a Python package.",
+        "ModuleNotFoundError": "The server is missing a Python module.",
     }
     hint = hints.get(name, f"Check the key and credit for `{employee.model}`.")
     return f"I could not finish. {hint}\n\n`{name}: {detail[:400]}`"
