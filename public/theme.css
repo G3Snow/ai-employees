@@ -1,0 +1,13 @@
+/* Group-chat styling: each employee keeps a visible name and bubble. */
+.message-author,
+[class*="author"] {
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+/* Hide Chainlit watermark / GitHub promo. */
+.watermark,
+a[href*="github.com/Chainlit"],
+a[href*="chainlit.io"] {
+  display: none !important;
+}

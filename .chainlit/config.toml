@@ -1,0 +1,43 @@
+# Kept intentionally small: Chainlit supplies defaults for anything not listed.
+[project]
+allow_origins = ["*"]
+session_timeout = 3600
+user_session_timeout = 1296000
+# Render (and most load balancers) can split polling and uploads across
+# processes; websocket-only keeps the chat session on one connection.
+transports = ["websocket"]
+
+[features]
+unsafe_allow_html = false
+latex = false
+edit_message = true
+
+[features.spontaneous_file_upload]
+enabled = true
+accept = ["image/*", "text/*", "application/pdf", "application/json", "text/csv", "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+max_files = 8
+max_size_mb = 12
+
+[UI]
+name = "AI Team"
+description = "Evaluator leads: clarify, lock a brief, specialists plan, you confirm before Technical builds"
+default_theme = "dark"
+default_sidebar_state = "open"
+cot = "hidden"
+custom_css = "/public/theme.css"
+custom_js = "/public/upload_session.js"
+logo_file_url = "/public/logo_dark.png"
+default_avatar_file_url = "/public/favicon.png"
+login_page_image = "/public/login_bg.png"
+custom_meta_url = "/"
+custom_meta_image_url = "/public/logo_dark.png"
+
+[[UI.header_links]]
+name = "AI Team"
+display_name = "AI Team"
+icon_url = "/public/favicon.png"
+url = "/"
+target = "_self"
+
+[meta]
+generated_by = "2.12.0"

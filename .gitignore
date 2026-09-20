@@ -1,6 +1,10 @@
 .env
+.venv/
+.venv312/
 __pycache__/
-.chainlit/
+.chainlit/*
+!.chainlit/config.toml
 .files/
+data/
 *.pyc
 .DS_Store
