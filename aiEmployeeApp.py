@@ -39,7 +39,7 @@ from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 logger = logging.getLogger("aiEmployees")
 
-APP_BUILD = "group-chat-9"
+APP_BUILD = "group-chat-10"
 
 EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-6-astra")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-fable-5-1")
@@ -47,7 +47,7 @@ TECHNICAL_MODEL = os.getenv("TECHNICAL_MODEL", "anthropic/claude-opus-5")
 TURN_TIMEOUT_SECONDS = int(os.getenv("TURN_TIMEOUT_SECONDS", "900"))
 # Bounds the provider call itself; the turn timeout alone cannot stop one already running.
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "840"))
-MAX_AGREEMENT_ROUNDS = max(1, int(os.getenv("MAX_AGREEMENT_ROUNDS", "2")))
+MAX_AGREEMENT_ROUNDS = max(1, int(os.getenv("MAX_AGREEMENT_ROUNDS", "3")))
 # GPT-6 Astra rejects reasoning_effort="none". Chat Completions also cannot
 # combine its function tools with any other effort, so those models use the
 # Responses API instead. low | medium | high | xhigh | max
@@ -55,10 +55,29 @@ _OPENAI_REASONING_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _DEFAULT_OPENAI_REASONING_EFFORT = "high"
 
 TRANSCRIPT_KEY = "transcript"
+PENDING_KEY = "pending_agreement"
+CHECKIN_MSG_KEY = "agreement_checkin_msg"
+BUSY_KEY = "team_busy"
+STALLED_KEY = "agreement_stalled"
 MAX_TRANSCRIPT_ENTRIES = 50
 MAX_ENTRY_CHARS = 4000
 
 _AGREEMENT_LINE = re.compile(r"(?im)^\s*AGREEMENT:\s*(yes|no)\b")
+EMPLOYEE_NAMES = ("Executor", "Evaluator", "Technical")
+_NAME_TOKEN = r"Executor|Evaluator|Technical"
+_OPENING_ADDRESS = re.compile(
+    rf"^\s*(?:(?:hey|hi|hello|ok|okay|please)\s+)?"
+    rf"((?:@?(?:{_NAME_TOKEN}))(?:\s*(?:,|\band\b|&|/)\s*@?(?:{_NAME_TOKEN}))*)"
+    rf"\s*[,:]\s*",
+    re.I,
+)
+_VOCATIVE = re.compile(
+    rf"(?:^|(?<=\n)|(?<=[.!?]\s))"
+    rf"(?:@({_NAME_TOKEN})(?:\s*[,:]|\s+)|({_NAME_TOKEN})\s*[,:]\s+)",
+    re.I,
+)
+_AT_NAME = re.compile(rf"@({_NAME_TOKEN})\b", re.I)
+_CHECKIN_MARKER = "have not independently agreed after"
 
 COLLABORATION_PROTOCOL = """
 You are in a live group chat with the user and two teammates:
@@ -76,6 +95,8 @@ Write one complete chat message now. Never wait for anyone else to speak.
 - For facts about products, APIs, vendors, or procedures: use search_web and fetch_url.
   Prefer official company, OEM, and vendor documentation. Reddit is allowed only when
   later replies in the same thread confirm the approach actually worked.
+- The user may address you by name (`Executor, …` or `@Evaluator`). Follow that
+  instruction; it outranks a teammate's last request, but not the user's original goal.
 """
 
 AGREEMENT_FOOTER = """
@@ -127,6 +148,45 @@ If the user asked for action (update code, edit a document, produce a file),
 carry it out now with write_text_file or write_spreadsheet. Ship the actual
 artifact, not a description of the change.
 """
+
+CONTINUE_HINT = """
+The user asked you to keep working toward independent agreement. Do not fake
+consensus. Continue the debate and fact-check with official sources.
+"""
+
+COMPROMISE_EXECUTOR = """
+The user asked you to lower the bar a little so a plan can ship. Keep what you
+and Evaluator already share. Drop remaining disagreements that are not unsafe,
+factually wrong, or against the user's goal. Post that most-agreed plan.
+""" + AGREEMENT_FOOTER
+
+COMPROMISE_EVALUATOR = """
+The user asked you to lower the bar a little. Do not rubber-stamp something
+false or off-goal. Do drop remaining non-deal-breaker objections so the version
+you already share the most can proceed. AGREEMENT: yes only if you can stand
+behind that compromise.
+""" + AGREEMENT_FOOTER
+
+TECHNICAL_HANDOFF = """
+Executor and Evaluator did not fully agree. The user told Front desk to send you
+what they have anyway. Use the latest plans in the thread. Prefer the overlap
+they already share. Treat remaining disagreements as risks to call out, then
+write a technically realistic deployment plan from proven practices. If the user
+asked for action, carry it out.
+"""
+
+TECHNICAL_DIRECTED = """
+The user addressed you by name. Follow their instruction. Use the current thread.
+If Executor and Evaluator never fully agreed, prefer their overlap and flag
+leftovers as risks. Still use proven practices only. If they asked for action,
+carry it out.
+"""
+
+CHOICE_LABELS = {
+    "continue": "Keep arguing",
+    "compromise": "Lower the bar a little",
+    "technical": "Send what they have to Technical",
+}
 
 
 @dataclass(frozen=True)
@@ -381,10 +441,10 @@ def _nameplate(speaker: str) -> str:
     return f"**{speaker}**\n\n"
 
 
-def _bubble(author: str, content: str) -> cl.Message:
+def _bubble(author: str, content: str, actions=None) -> cl.Message:
     """Chainlit parents new messages to the `on_message` run step, which is never
     saved, so a resumed thread would drop every reply as an orphan."""
-    message = cl.Message(author=author, content=content)
+    message = cl.Message(author=author, content=content, actions=actions or [])
     message.parent_id = None
     return message
 
@@ -537,6 +597,115 @@ def _both_agree(executor_text: str, evaluator_text: str) -> bool:
     return _agrees(executor_text) and _agrees(evaluator_text)
 
 
+def _canon_name(raw: str) -> Optional[str]:
+    for name in EMPLOYEE_NAMES:
+        if name.lower() == (raw or "").strip().lower():
+            return name
+    return None
+
+
+def _names_in(blob: str) -> list[str]:
+    found: list[str] = []
+    for match in re.finditer(_NAME_TOKEN, blob or "", re.I):
+        name = _canon_name(match.group(0))
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _vocative_name(match: re.Match) -> Optional[str]:
+    return _canon_name(match.group(1) or match.group(2) or "")
+
+
+def _apply_vocatives(notes: dict[str, str], text: str) -> None:
+    matches = list(_VOCATIVE.finditer(text or ""))
+    for index, match in enumerate(matches):
+        name = _vocative_name(match)
+        if not name:
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        notes[name] = text[match.end() : end].strip()
+
+
+def parse_named_instructions(text: str) -> dict[str, str]:
+    """Map teammate name → instruction when the user addresses them vocatively."""
+    text = (text or "").strip()
+    notes: dict[str, str] = {}
+    if not text:
+        return notes
+
+    opening = _OPENING_ADDRESS.match(text)
+    body = text
+    if opening:
+        body = text[opening.end() :]
+        vocatives = list(_VOCATIVE.finditer(body))
+        shared = body[: vocatives[0].start()].strip() if vocatives else body.strip()
+        for name in _names_in(opening.group(1)):
+            notes[name] = shared
+        _apply_vocatives(notes, body)
+    else:
+        _apply_vocatives(notes, text)
+
+    for match in _AT_NAME.finditer(text):
+        name = _canon_name(match.group(1))
+        if name and name not in notes:
+            notes[name] = text.strip()
+
+    return {name: " ".join(instruction.split()).strip(" ,") for name, instruction in notes.items()}
+
+
+def parse_agreement_choice(text: str) -> Optional[str]:
+    """Return continue / compromise / technical from a free-text reply, if any."""
+    stripped = (text or "").strip()
+    lowered = stripped.lower()
+    for key, label in CHOICE_LABELS.items():
+        if lowered == label.lower():
+            return key
+    if re.search(
+        r"\b((send|give|pass|hand)\b.{0,40}\btechnical\b|take what (they|you|we) have|"
+        r"give it to technical|just ship|as[- ]is to technical)\b",
+        lowered,
+        re.S,
+    ):
+        return "technical"
+    if re.search(
+        r"\b(compromise|lower the bar|reduce (the )?standards|relax (the )?(standards|bar)|"
+        r"most agreed|good enough)\b",
+        lowered,
+    ):
+        return "compromise"
+    if re.search(
+        r"\b(keep (going|arguing)|continue|another (round|try)|try again|keep working)\b",
+        lowered,
+    ):
+        return "continue"
+    return None
+
+
+def _user_note_brief(name: str, instruction: str) -> str:
+    if not instruction:
+        return f"The user addressed you ({name}) by name this turn.\n"
+    return (
+        f"The user addressed you ({name}) by name this turn. Follow this instruction; "
+        f"it outranks your teammate's last request, but not the user's original goal:\n"
+        f"{instruction}\n"
+    )
+
+
+def _directed_brief(employee: Employee, instruction: str, wants_agreement: bool) -> str:
+    note = _user_note_brief(employee.name, instruction)
+    if employee.name == "Technical":
+        return note + TECHNICAL_DIRECTED
+    if not wants_agreement:
+        return (
+            note
+            + "The rest of the team is silent this turn unless also named. Reply now. "
+            "Skip the AGREEMENT line unless you are actually accepting a plan."
+        )
+    extra = EXECUTOR_REBUTTAL if employee.name == "Executor" else EVALUATOR_REBUTTAL
+    return note + extra
+
+
 async def _run_turn(
     employee: Employee,
     request: str,
@@ -557,15 +726,53 @@ async def _run_turn(
     return reply, ok
 
 
+async def _agreement_rounds(
+    request: str,
+    incoming: IncomingFiles,
+    failed: list[str],
+    *,
+    rounds: int,
+    executor_extra: str,
+    evaluator_extra: str,
+    lead: Optional[str] = None,
+    last_round_hint: str,
+) -> bool:
+    executor = _named("Executor")
+    evaluator = _named("Evaluator")
+    order = [evaluator, executor] if lead == "Evaluator" else [executor, evaluator]
+    replies = {"Executor": "", "Evaluator": ""}
+    for round_index in range(1, rounds + 1):
+        hint = last_round_hint if round_index == rounds else ""
+        for employee in order:
+            extra = executor_extra if employee.name == "Executor" else evaluator_extra
+            reply, ok = await _run_turn(
+                employee, request, incoming, failed, extra + hint
+            )
+            if not ok:
+                return False
+            replies[employee.name] = reply
+        if _both_agree(replies["Executor"], replies["Evaluator"]):
+            return True
+    return False
+
+
+async def _send_to_technical(
+    request: str,
+    incoming: IncomingFiles,
+    failed: list[str],
+    extra_brief: str,
+) -> None:
+    await _run_turn(_named("Technical"), request, incoming, failed, extra_brief)
+
+
 async def _collaborate(
     request: str, incoming: IncomingFiles
 ) -> tuple[list[str], bool]:
     """Executor drafts, Evaluator reviews, they debate, Technical only after both agree."""
     failed: list[str] = []
-    agreed = False
     executor = _named("Executor")
     evaluator = _named("Evaluator")
-    technical = _named("Technical")
+    agreed = False
 
     _, executor_ok = await _run_turn(
         executor, request, incoming, failed, EXECUTOR_DRAFT
@@ -575,41 +782,255 @@ async def _collaborate(
             evaluator, request, incoming, failed, EVALUATOR_FIRST
         )
         if evaluator_ok:
-            last_round = MAX_AGREEMENT_ROUNDS
-            for round_index in range(1, last_round + 1):
-                last_hint = ""
-                if round_index == last_round:
-                    last_hint = (
-                        "\nThis is the last debate round. Do not fake consensus. "
-                        "If you cannot independently agree, keep AGREEMENT: no.\n"
-                    )
-                executor_reply, executor_ok = await _run_turn(
-                    executor,
-                    request,
-                    incoming,
-                    failed,
-                    EXECUTOR_REBUTTAL + last_hint,
-                )
-                if not executor_ok:
-                    break
-                evaluator_reply, evaluator_ok = await _run_turn(
-                    evaluator,
-                    request,
-                    incoming,
-                    failed,
-                    EVALUATOR_REBUTTAL + last_hint,
-                )
-                if not evaluator_ok:
-                    break
-                if _both_agree(executor_reply, evaluator_reply):
-                    agreed = True
-                    break
+            agreed = await _agreement_rounds(
+                request,
+                incoming,
+                failed,
+                rounds=MAX_AGREEMENT_ROUNDS,
+                executor_extra=EXECUTOR_REBUTTAL,
+                evaluator_extra=EVALUATOR_REBUTTAL,
+                last_round_hint=(
+                    "\nThis is the last debate round. Do not fake consensus. "
+                    "If you cannot independently agree, keep AGREEMENT: no.\n"
+                ),
+            )
 
     if not failed and agreed:
-        await _run_turn(
-            technical, request, incoming, failed, TECHNICAL_AFTER_AGREEMENT
+        await _send_to_technical(
+            request, incoming, failed, TECHNICAL_AFTER_AGREEMENT
         )
     return failed, agreed
+
+
+async def _directed_turns(
+    request: str, incoming: IncomingFiles, notes: dict[str, str]
+) -> tuple[list[str], bool]:
+    """Only the teammates the user named speak this turn."""
+    failed: list[str] = []
+    named = {name for name in notes if name in EMPLOYEE_NAMES}
+    wants_agreement = "Executor" in named and "Evaluator" in named
+    replies = {"Executor": "", "Evaluator": ""}
+    for employee in TEAM:
+        if employee.name not in named:
+            continue
+        reply, ok = await _run_turn(
+            employee,
+            request,
+            incoming,
+            failed,
+            _directed_brief(employee, notes[employee.name], wants_agreement),
+        )
+        if not ok:
+            continue
+        if employee.name in replies:
+            replies[employee.name] = reply
+
+    agreed = wants_agreement and not failed and _both_agree(
+        replies["Executor"], replies["Evaluator"]
+    )
+    if agreed and "Technical" not in named:
+        await _send_to_technical(
+            request, incoming, failed, TECHNICAL_AFTER_AGREEMENT
+        )
+    return failed, agreed
+
+
+def _checkin_text() -> str:
+    n = MAX_AGREEMENT_ROUNDS
+    return (
+        f"{_nameplate('Front desk')}"
+        f"Executor and Evaluator {_CHECKIN_MARKER} {n} attempts, so I have not "
+        "sent this to Technical.\n\n"
+        "How do you want to proceed?\n"
+        "- **Keep arguing** — they continue until they can both stand behind a plan.\n"
+        "- **Lower the bar a little** — they converge on the version they already "
+        "share the most, dropping remaining non-deal-breaker disagreements.\n"
+        "- **Send to Technical** — Technical takes the current plan as-is and treats "
+        "leftover disagreements as risks.\n\n"
+        "Click a button, or reply in chat. You can also instruct someone by name, "
+        "for example:\n"
+        "- `Evaluator, drop the multi-region requirement`\n"
+        "- `Executor, keep SQLite. Evaluator, that is acceptable.`\n"
+        "- `@Technical implement the overlap they already have`"
+    )
+
+
+def _checkin_actions() -> list:
+    return [
+        cl.Action(
+            name="agreement_choice",
+            payload={"choice": "continue"},
+            label="Keep arguing",
+            icon="messages-square",
+            tooltip="They keep debating toward independent agreement.",
+        ),
+        cl.Action(
+            name="agreement_choice",
+            payload={"choice": "compromise"},
+            label="Lower the bar a little",
+            icon="scale",
+            tooltip="Ship the most agreed-upon version.",
+        ),
+        cl.Action(
+            name="agreement_choice",
+            payload={"choice": "technical"},
+            label="Send to Technical",
+            icon="hammer",
+            tooltip="Take what they have and hand it to Technical.",
+        ),
+    ]
+
+
+def _is_checkin_text(content: str) -> bool:
+    text = content or ""
+    return _CHECKIN_MARKER in text and "How do you want to proceed?" in text
+
+
+async def _ask_how_to_proceed() -> None:
+    note = _checkin_text()
+    _remember("Front desk", note)
+    bubble = _bubble("Front desk", note, actions=_checkin_actions())
+    await bubble.send()
+    cl.user_session.set(PENDING_KEY, True)
+    cl.user_session.set(STALLED_KEY, True)
+    cl.user_session.set(CHECKIN_MSG_KEY, bubble)
+
+
+async def _dismiss_checkin() -> None:
+    bubble = cl.user_session.get(CHECKIN_MSG_KEY)
+    cl.user_session.set(PENDING_KEY, False)
+    cl.user_session.set(CHECKIN_MSG_KEY, None)
+    actions = list(getattr(bubble, "actions", None) or [])
+    for action in actions:
+        try:
+            await action.remove()
+        except Exception as exc:
+            logger.warning("Could not remove check-in button (%s).", exc)
+
+
+async def _announce_failures(failed: list[str]) -> None:
+    await _bubble(
+        "Front desk",
+        _nameplate("Front desk")
+        + f"{', '.join(failed)} could not reply this turn, so the plan above is "
+        "missing their input. Fix the error shown in their message and send again.",
+    ).send()
+
+
+async def _wrap_up(failed: list[str], agreed: bool, *, check_in: bool) -> None:
+    if failed:
+        await _announce_failures(failed)
+        return
+    if agreed:
+        cl.user_session.set(STALLED_KEY, False)
+        return
+    if check_in:
+        await _ask_how_to_proceed()
+
+
+async def _handle_agreement_decision(
+    request: str,
+    incoming: IncomingFiles,
+    *,
+    choice: Optional[str] = None,
+) -> None:
+    notes = parse_named_instructions(request)
+    parsed = parse_agreement_choice(request)
+    explicit_path = choice is not None or parsed is not None
+    if choice is None:
+        choice = parsed
+    if choice is None:
+        choice = "technical" if list(notes) == ["Technical"] else "continue"
+        explicit_path = list(notes) == ["Technical"]
+
+    named_steer = bool(notes) and choice == "continue" and not explicit_path
+    if named_steer:
+        recipients = [name for name in notes if name != "Technical"]
+        who = ", ".join(recipients) or "the team"
+        ack = (
+            f"{_nameplate('Front desk')}I'll pass that to {who} and have Executor and "
+            "Evaluator take another pass."
+        )
+        if "Technical" in notes:
+            ack += " I'll hold Technical until they finish."
+    else:
+        label = CHOICE_LABELS[choice]
+        ack = f"{_nameplate('Front desk')}Got it — {label.lower()}."
+        recipients = [
+            name for name in notes if choice == "technical" or name != "Technical"
+        ]
+        if recipients:
+            ack += f" I'll also pass your instruction to {', '.join(recipients)}."
+        if choice != "technical" and "Technical" in notes:
+            ack += " I'll hold Technical until Executor and Evaluator finish."
+    _remember("Front desk", ack)
+    await _bubble("Front desk", ack).send()
+
+    failed: list[str] = []
+    if choice == "technical":
+        for employee in TEAM:
+            if employee.name == "Technical" or employee.name not in notes:
+                continue
+            await _run_turn(
+                employee,
+                request,
+                incoming,
+                failed,
+                _directed_brief(employee, notes[employee.name], False),
+            )
+        tech_brief = TECHNICAL_HANDOFF
+        if notes.get("Technical"):
+            tech_brief = _user_note_brief("Technical", notes["Technical"]) + tech_brief
+        if not failed:
+            await _send_to_technical(request, incoming, failed, tech_brief)
+        await _wrap_up(failed, True, check_in=False)
+        return
+
+    if choice == "compromise":
+        executor_extra = COMPROMISE_EXECUTOR
+        evaluator_extra = COMPROMISE_EVALUATOR
+        rounds = max(1, min(2, MAX_AGREEMENT_ROUNDS))
+        last_hint = (
+            "\nThis is the last compromise round. Agree if you can stand behind the "
+            "most-shared plan; keep AGREEMENT: no if it is still wrong or off-goal.\n"
+        )
+    else:
+        executor_extra = EXECUTOR_REBUTTAL + CONTINUE_HINT
+        evaluator_extra = EVALUATOR_REBUTTAL + CONTINUE_HINT
+        rounds = 1 if named_steer else MAX_AGREEMENT_ROUNDS
+        last_hint = (
+            "\nThis is the last debate round. Do not fake consensus. "
+            "If you cannot independently agree, keep AGREEMENT: no.\n"
+        )
+
+    if notes.get("Executor"):
+        executor_extra = _user_note_brief("Executor", notes["Executor"]) + executor_extra
+    if notes.get("Evaluator"):
+        evaluator_extra = (
+            _user_note_brief("Evaluator", notes["Evaluator"]) + evaluator_extra
+        )
+
+    lead = None
+    if "Evaluator" in notes and "Executor" not in notes:
+        lead = "Evaluator"
+    elif "Executor" in notes and "Evaluator" not in notes:
+        lead = "Executor"
+
+    agreed = await _agreement_rounds(
+        request,
+        incoming,
+        failed,
+        rounds=rounds,
+        executor_extra=executor_extra,
+        evaluator_extra=evaluator_extra,
+        lead=lead,
+        last_round_hint=last_hint,
+    )
+    if not failed and agreed:
+        await _send_to_technical(
+            request, incoming, failed, TECHNICAL_AFTER_AGREEMENT
+        )
+    await _wrap_up(failed, agreed, check_in=True)
 
 
 async def _name_thread(user_text: str) -> None:
@@ -663,10 +1084,13 @@ def _welcome_lines() -> list[str]:
         "and OEM sources (Reddit only when replies confirmed success)",
         f"- **Evaluator** (`{EVALUATOR_MODEL}`) — project manager: audits the whole thread, "
         "fact-checks hard, and keeps the work on your larger goal",
-        "- They argue and fact-check each other until both independently agree. Only then:",
+        f"- They argue up to {MAX_AGREEMENT_ROUNDS} times. If they still don't independently "
+        "agree, I check in with you before Technical starts.",
         f"- **Technical** (`{TECHNICAL_MODEL}`) — technical deployment plan, and does the "
         "work if you asked for action",
         "",
+        "Address someone by name to instruct just them, e.g. `Executor, drop Kubernetes` "
+        "or `@Evaluator you're too strict on tests`.",
         "Attach images or spreadsheets with the paperclip. The team can send files back too.",
         f"_Build {APP_BUILD}_",
     ]
@@ -691,6 +1115,10 @@ def _welcome_lines() -> list[str]:
 async def on_chat_start():
     cl.user_session.set(TRANSCRIPT_KEY, [])
     cl.user_session.set("thread_named", False)
+    cl.user_session.set(PENDING_KEY, False)
+    cl.user_session.set(CHECKIN_MSG_KEY, None)
+    cl.user_session.set(BUSY_KEY, False)
+    cl.user_session.set(STALLED_KEY, False)
     await _bubble("Front desk", "\n".join(_welcome_lines())).send()
 
 
@@ -698,6 +1126,8 @@ async def on_chat_start():
 async def on_chat_resume(thread):
     """Reload an old conversation so the team keeps its memory of it."""
     cl.user_session.set("thread_named", True)
+    cl.user_session.set(CHECKIN_MSG_KEY, None)
+    cl.user_session.set(BUSY_KEY, False)
     roles = {employee.name for employee in TEAM}
     history: list[str] = []
     for step in thread.get("steps") or []:
@@ -712,6 +1142,74 @@ async def on_chat_resume(thread):
         elif speaker in roles or speaker in {"Front desk", "Chat moderator"}:
             history.append(f"{speaker}: {content[:MAX_ENTRY_CHARS]}")
     cl.user_session.set(TRANSCRIPT_KEY, history[-MAX_TRANSCRIPT_ENTRIES:])
+    pending = bool(history) and history[-1].startswith("Front desk:") and _is_checkin_text(
+        history[-1]
+    )
+    cl.user_session.set(PENDING_KEY, pending)
+    cl.user_session.set(STALLED_KEY, pending)
+
+
+async def _busy_guard() -> bool:
+    if cl.user_session.get(BUSY_KEY):
+        await _bubble(
+            "Front desk",
+            _nameplate("Front desk")
+            + "The team is still working on the last instruction. Wait for them to finish.",
+        ).send()
+        return True
+    return False
+
+
+async def _run_user_request(request: str, incoming: IncomingFiles) -> None:
+    cl.user_session.set(BUSY_KEY, True)
+    try:
+        if cl.user_session.get(PENDING_KEY):
+            await _dismiss_checkin()
+            await _handle_agreement_decision(request, incoming)
+            return
+
+        notes = parse_named_instructions(request)
+        if notes:
+            failed, agreed = await _directed_turns(request, incoming, notes)
+            stalled = bool(cl.user_session.get(STALLED_KEY))
+            both_named = "Executor" in notes and "Evaluator" in notes
+            await _wrap_up(
+                failed, agreed, check_in=stalled and both_named and not agreed
+            )
+            return
+
+        failed, agreed = await _collaborate(request, incoming)
+        await _wrap_up(failed, agreed, check_in=not agreed)
+    finally:
+        cl.user_session.set(BUSY_KEY, False)
+
+
+@cl.action_callback("agreement_choice")
+async def on_agreement_choice(action: cl.Action):
+    if missing := missing_provider_keys():
+        await _bubble(
+            "Front desk",
+            _nameplate("Front desk")
+            + "The team can't reply until these keys are set on the server: "
+            + ", ".join(f"`{key}`" for key in missing),
+        ).send()
+        return
+    if await _busy_guard():
+        return
+    if not cl.user_session.get(PENDING_KEY):
+        return
+    choice = (action.payload or {}).get("choice")
+    if choice not in CHOICE_LABELS:
+        return
+    label = CHOICE_LABELS[choice]
+    _remember("You", label)
+    incoming = IncomingFiles(prompt_block="", summary="")
+    cl.user_session.set(BUSY_KEY, True)
+    try:
+        await _dismiss_checkin()
+        await _handle_agreement_decision(label, incoming, choice=choice)
+    finally:
+        cl.user_session.set(BUSY_KEY, False)
 
 
 @cl.on_message
@@ -724,6 +1222,8 @@ async def on_message(message: cl.Message):
             + ", ".join(f"`{key}`" for key in missing),
         ).send()
         return
+    if await _busy_guard():
+        return
 
     request = (message.content or "").strip() or "Please review the attached files."
     stash = FileWorkspace()
@@ -732,22 +1232,6 @@ async def on_message(message: cl.Message):
         title_source = (message.content or "").strip() or incoming.summary or request
         await _name_thread(title_source)
         _remember("You", request + (f"\n[{incoming.summary}]" if incoming.summary else ""))
-
-        failed, agreed = await _collaborate(request, incoming)
-
-        if failed:
-            await _bubble(
-                "Front desk",
-                _nameplate("Front desk")
-                + f"{', '.join(failed)} could not reply this turn, so the plan above is "
-                "missing their input. Fix the error shown in their message and send again.",
-            ).send()
-        elif not agreed:
-            note = (
-                "Executor and Evaluator did not both independently agree, so Technical "
-                "did not start. Send a follow-up if you want them to keep arguing the plan."
-            )
-            _remember("Chat moderator", note)
-            await _bubble("Front desk", _nameplate("Front desk") + note).send()
+        await _run_user_request(request, incoming)
     finally:
         stash.close()
