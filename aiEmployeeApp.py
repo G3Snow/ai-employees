@@ -264,6 +264,7 @@ def _failure_message(employee: Employee, exc: Exception) -> str:
         "APITimeoutError": "The provider stopped responding.",
         "BadRequestError": f"The provider rejected the request for `{employee.model}`.",
         "ValueError": f"`{employee.model}` returned an empty response.",
+        "ImportError": f"The server is missing the package for `{employee.model}`.",
     }
     hint = hints.get(name, f"Check the key and credit for `{employee.model}`.")
     return f"I could not finish. {hint}\n\n`{name}: {detail[:400]}`"
