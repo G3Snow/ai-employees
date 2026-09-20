@@ -4,7 +4,9 @@ import asyncio
 import logging
 import os
 import secrets
+import ssl
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from sqlalchemy import text
@@ -17,6 +19,12 @@ SQLITE_PATH = DATA_DIR / "chainlit.db"
 AUTH_SECRET_FILE = DATA_DIR / "auth_secret"
 AUTH_SECRET_KEY = "chainlit_auth_secret"
 BOOTSTRAP_TIMEOUT_SECONDS = 20
+BOOTSTRAP_ATTEMPTS = 3
+
+# asyncpg takes SSL as a connect argument, so libpq-style query keys must go.
+LIBPQ_ONLY_PARAMS = {"sslmode", "ssl", "sslrootcert", "sslcert", "sslkey", "channel_binding"}
+
+_storage_error: str | None = None
 
 SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -175,13 +183,19 @@ CREATE TABLE IF NOT EXISTS app_settings (
 """
 
 
+def _as_asyncpg_url(raw: str) -> str:
+    parts = urlsplit(raw)
+    query = [(k, v) for k, v in parse_qsl(parts.query) if k.lower() not in LIBPQ_ONLY_PARAMS]
+    return urlunsplit(("postgresql+asyncpg", parts.netloc, parts.path, urlencode(query), ""))
+
+
 def database_url() -> str:
     """Async SQLAlchemy URL. Falls back to a local sqlite file."""
     raw = os.getenv("DATABASE_URL", "").strip()
     if raw:
-        for prefix in ("postgresql+asyncpg://", "postgres://", "postgresql://"):
-            if raw.startswith(prefix):
-                return "postgresql+asyncpg://" + raw[len(prefix) :]
+        scheme = raw.split("://", 1)[0].lower()
+        if scheme in {"postgres", "postgresql", "postgresql+asyncpg"}:
+            return _as_asyncpg_url(raw)
         return raw
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     return f"sqlite+aiosqlite:///{SQLITE_PATH}"
@@ -206,7 +220,18 @@ def postgres_ssl_required() -> bool:
 
 
 def connect_args() -> dict:
-    return {"ssl": True} if uses_postgres() and postgres_ssl_required() else {}
+    """Matches the SSL context Chainlit's data layer builds, so both engines agree."""
+    if not (uses_postgres() and postgres_ssl_required()):
+        return {}
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return {"ssl": context}
+
+
+def storage_error() -> str | None:
+    """Set when the tables could not be created, which means history will not save."""
+    return _storage_error
 
 
 async def _prepare_storage() -> str:
@@ -217,6 +242,7 @@ async def _prepare_storage() -> str:
             for statement in schema.split(";"):
                 if statement.strip():
                     await conn.execute(text(statement))
+        async with engine.begin() as conn:
             await conn.execute(
                 text(
                     'INSERT INTO app_settings ("key", "value") VALUES (:key, :value) '
@@ -233,6 +259,21 @@ async def _prepare_storage() -> str:
         await engine.dispose()
 
 
+async def _prepare_storage_with_retry() -> str:
+    """Two servers booting together can collide on CREATE TABLE; the loser just retries."""
+    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+        try:
+            return await asyncio.wait_for(
+                _prepare_storage(), timeout=BOOTSTRAP_TIMEOUT_SECONDS
+            )
+        except Exception as exc:
+            if attempt == BOOTSTRAP_ATTEMPTS:
+                raise
+            logger.warning("Storage bootstrap attempt %s failed (%s); retrying.", attempt, exc)
+            await asyncio.sleep(attempt)
+    raise RuntimeError("unreachable")
+
+
 def _file_secret() -> str:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if AUTH_SECRET_FILE.exists():
@@ -246,13 +287,16 @@ def _file_secret() -> str:
 
 def bootstrap() -> None:
     """Create the history tables and pin an auth secret before Chainlit loads."""
+    global _storage_error
     load_dotenv()
     try:
-        secret = asyncio.run(
-            asyncio.wait_for(_prepare_storage(), timeout=BOOTSTRAP_TIMEOUT_SECONDS)
-        )
+        secret = asyncio.run(_prepare_storage_with_retry())
+        _storage_error = None
     except Exception as exc:
-        logger.warning("Storage bootstrap failed (%s); chat history may not persist.", exc)
+        # Chainlit's data layer logs and swallows every SQL error, so without this
+        # the app would look healthy while saving nothing.
+        _storage_error = f"{type(exc).__name__}: {exc}"
+        logger.error("Storage bootstrap failed (%s); chat history will not persist.", exc)
         secret = None
 
     if not os.getenv("CHAINLIT_AUTH_SECRET"):

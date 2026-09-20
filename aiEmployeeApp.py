@@ -2,6 +2,7 @@
 
 import asyncio
 import hmac
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -11,8 +12,7 @@ from persistence import (
     connect_args,
     database_url,
     history_is_durable,
-    postgres_ssl_required,
-    uses_postgres,
+    storage_error,
 )
 
 # Must run before Chainlit is imported: it reads the auth secret at import time.
@@ -22,12 +22,16 @@ import chainlit as cl
 from chainlit.data import get_data_layer as chainlit_data_layer
 from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
-APP_BUILD = "group-chat-2"
+logger = logging.getLogger("aiEmployees")
+
+APP_BUILD = "group-chat-3"
 
 EXECUTOR_MODEL = os.getenv("EXECUTOR_MODEL", "openai/gpt-4o")
 EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "anthropic/claude-3-5-sonnet-20240620")
 TECHNICAL_MODEL = os.getenv("TECHNICAL_MODEL", "openai/gpt-4o")
 TURN_TIMEOUT_SECONDS = int(os.getenv("TURN_TIMEOUT_SECONDS", "240"))
+# Bounds the provider call itself; the turn timeout alone cannot stop one already running.
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "180"))
 
 TRANSCRIPT_KEY = "transcript"
 MAX_TRANSCRIPT_ENTRIES = 12
@@ -117,11 +121,6 @@ TEAM = (
 )
 
 
-def demo_mode() -> bool:
-    """Scripted replies for local UI work, so the UI can be tested without API keys."""
-    return os.getenv("DEMO_MODE", "").strip().lower() in {"1", "true", "yes"}
-
-
 def missing_provider_keys() -> list[str]:
     models = " ".join(employee.model for employee in TEAM)
     missing = []
@@ -142,14 +141,14 @@ def _remember(speaker: str, message: str) -> None:
     cl.user_session.set(TRANSCRIPT_KEY, history)
 
 
-def _build_crew(employee: Employee, user_request: str):
+def _build_crew(employee: Employee, user_request: str, stream: bool):
     from crewai import Agent, Crew, LLM, Process, Task
 
     agent = Agent(
         role=employee.name,
         goal=employee.goal,
         backstory=f"{employee.backstory}\n{COLLABORATION_PROTOCOL}",
-        llm=LLM(model=employee.model, stream=True),
+        llm=LLM(model=employee.model, stream=stream, timeout=REQUEST_TIMEOUT_SECONDS),
         allow_delegation=False,
         max_iter=3,
         verbose=False,
@@ -168,15 +167,34 @@ def _build_crew(employee: Employee, user_request: str):
         agents=[agent],
         tasks=[task],
         process=Process.sequential,
-        stream=True,
+        stream=stream,
         verbose=False,
     )
 
 
-def _final_text(streaming_output) -> str:
-    result = getattr(streaming_output, "result", streaming_output)
+def _result_text(output) -> str:
+    """CrewOutput, or the finished result of a stream; `.result` re-raises crew errors."""
+    result = output
+    if hasattr(type(output), "result"):
+        try:
+            result = output.result
+        except RuntimeError:
+            return ""
     raw = getattr(result, "raw", None)
     return (raw if isinstance(raw, str) else str(result)).strip()
+
+
+def _strip_scaffolding(text: str) -> str:
+    """Streamed tokens carry the agent's `Thought:`/`Final Answer:` framing; the result does not."""
+    marker = "Final Answer:"
+    if marker in text:
+        text = text.rsplit(marker, 1)[1]
+    return text.strip()
+
+
+def _is_text_chunk(chunk) -> bool:
+    kind = getattr(getattr(chunk, "chunk_type", None), "value", "text")
+    return kind == "text"
 
 
 def _nameplate(speaker: str) -> str:
@@ -184,10 +202,36 @@ def _nameplate(speaker: str) -> str:
     return f"**{speaker}**\n\n"
 
 
+def _bubble(author: str, content: str) -> cl.Message:
+    """Chainlit parents new messages to the `on_message` run step, which is never
+    saved, so a resumed thread would drop every reply as an orphan."""
+    message = cl.Message(author=author, content=content)
+    message.parent_id = None
+    return message
+
+
+async def _stream_reply(employee: Employee, user_request: str, show) -> str:
+    output = await _build_crew(employee, user_request, stream=True).akickoff()
+    if not hasattr(output, "__aiter__"):
+        return _result_text(output)
+
+    streamed: list[str] = []
+    try:
+        async for chunk in output:
+            token = getattr(chunk, "content", "") or ""
+            if token and _is_text_chunk(chunk):
+                streamed.append(token)
+                await show(token)
+    finally:
+        # An abandoned stream keeps its worker threads; closing it at least stops
+        # this consumer from being resumed against a session that has gone away.
+        await output.aclose()
+    return _result_text(output) or _strip_scaffolding("".join(streamed))
+
+
 async def _speak(employee: Employee, bubble: cl.Message, user_request: str) -> str:
     """Stream one employee's reply into its own chat bubble."""
     started = False
-    streamed: list[str] = []
 
     async def show(token: str) -> None:
         nonlocal started
@@ -196,35 +240,37 @@ async def _speak(employee: Employee, bubble: cl.Message, user_request: str) -> s
             started = True
             bubble.content = _nameplate(employee.name)
             await bubble.update()
-        streamed.append(token)
         await bubble.stream_token(token)
 
-    if demo_mode():
-        demo = (
-            "Demo mode is on, so this is a scripted reply to "
-            f'"{user_request.strip()[:120]}" instead of a real model call.'
-        )
-        for word in demo.split(" "):
-            await show(word + " ")
-            await asyncio.sleep(0.02)
-        return demo
+    try:
+        return await _stream_reply(employee, user_request, show)
+    except (AttributeError, TypeError) as exc:
+        # A CrewAI release that reshapes the streaming API should cost live typing,
+        # not the answer itself.
+        logger.warning("Streaming unavailable (%s); falling back to a single reply.", exc)
+        output = await _build_crew(employee, user_request, stream=False).akickoff()
+        return _result_text(output)
 
-    crew = _build_crew(employee, user_request)
-    streaming_output = await crew.akickoff()
-    chunks = streaming_output if hasattr(streaming_output, "__aiter__") else streaming_output.llm
-    async for chunk in chunks:
-        token = getattr(chunk, "content", "") or ""
-        if token:
-            await show(token)
-    # Keep the streamed words if the run ends without a packaged result.
-    return _final_text(streaming_output) or "".join(streamed).strip()
+
+def _failure_message(employee: Employee, exc: Exception) -> str:
+    name = type(exc).__name__
+    detail = str(exc).strip() or name
+    hints = {
+        "AuthenticationError": f"The API key for `{employee.model}` was rejected.",
+        "PermissionDeniedError": f"That key is not allowed to use `{employee.model}`.",
+        "NotFoundError": f"`{employee.model}` does not exist for this account.",
+        "RateLimitError": "The provider is rate limiting, or the account is out of credit.",
+        "APIConnectionError": "The provider could not be reached from the server.",
+        "APITimeoutError": "The provider stopped responding.",
+        "BadRequestError": f"The provider rejected the request for `{employee.model}`.",
+        "ValueError": f"`{employee.model}` returned an empty response.",
+    }
+    hint = hints.get(name, f"Check the key and credit for `{employee.model}`.")
+    return f"I could not finish. {hint}\n\n`{name}: {detail[:400]}`"
 
 
 async def take_turn(employee: Employee, user_request: str) -> tuple[str, bool]:
-    bubble = cl.Message(
-        author=employee.name,
-        content=f"{_nameplate(employee.name)}_{employee.thinking}_",
-    )
+    bubble = _bubble(employee.name, f"{_nameplate(employee.name)}_{employee.thinking}_")
     await bubble.send()
     try:
         reply = await asyncio.wait_for(
@@ -237,12 +283,12 @@ async def take_turn(employee: Employee, user_request: str) -> tuple[str, bool]:
             "Try a smaller request, or raise TURN_TIMEOUT_SECONDS on the server."
         )
         ok = False
+    except asyncio.CancelledError:
+        # The browser went away; writing to its session would raise again.
+        raise
     except Exception as exc:
-        reply = (
-            f"I could not finish: `{type(exc).__name__}: {exc}`\n\n"
-            "This is usually a missing or rejected API key for "
-            f"`{employee.model}`, or no credit left on that provider."
-        )
+        logger.exception("%s turn failed", employee.name)
+        reply = _failure_message(employee, exc)
         ok = False
 
     # Replace the streamed draft with the clean final answer.
@@ -253,18 +299,18 @@ async def take_turn(employee: Employee, user_request: str) -> tuple[str, bool]:
 
 
 async def _name_thread(user_text: str) -> None:
+    """Title the conversation from its first message only; a later one must not rename it."""
     if cl.user_session.get("thread_named"):
         return
     cl.user_session.set("thread_named", True)
-    layer = chainlit_data_layer()
-    thread_id = getattr(cl.context.session, "thread_id", None)
-    if not layer or not thread_id:
-        return
     title = " ".join(user_text.split())[:80] or "New chat"
     try:
-        await layer.update_thread(thread_id=thread_id, name=title)
-    except Exception:
-        pass
+        layer = chainlit_data_layer()
+        thread_id = getattr(cl.context.session, "thread_id", None)
+        if layer and thread_id:
+            await layer.update_thread(thread_id=thread_id, name=title)
+    except Exception as exc:
+        logger.warning("Could not title the thread (%s).", exc)
 
 
 @cl.data_layer
@@ -272,7 +318,6 @@ def get_data_layer():
     return SQLAlchemyDataLayer(
         conninfo=database_url(),
         connect_args=connect_args(),
-        ssl_require=uses_postgres() and postgres_ssl_required(),
         user_thread_limit=200,
         show_logger=False,
     )
@@ -311,19 +356,21 @@ async def on_chat_start():
         "Your past chats are in the left sidebar. Open one to continue it.",
         f"_Build {APP_BUILD}_",
     ]
-    if demo_mode():
-        lines.append("\n**Demo mode is on** — replies are scripted, no models are called.")
-    elif missing := missing_provider_keys():
+    if missing := missing_provider_keys():
         lines.append(
             "\n**Not ready yet.** The server is missing " + ", ".join(f"`{k}`" for k in missing)
             + ". Add them in the Render dashboard under Environment, then redeploy."
         )
-    if not history_is_durable():
+    if failure := storage_error():
+        lines.append(
+            f"\n**History is not saving.** The database could not be prepared: `{failure}`"
+        )
+    elif not history_is_durable():
         lines.append(
             "\n**History is temporary.** Set `DATABASE_URL` to a Postgres database so "
             "these chats survive restarts."
         )
-    await cl.Message(content="\n".join(lines), author="Front desk").send()
+    await _bubble("Front desk", "\n".join(lines)).send()
 
 
 @cl.on_chat_resume
@@ -348,10 +395,10 @@ async def on_chat_resume(thread):
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    if not demo_mode() and (missing := missing_provider_keys()):
-        await cl.Message(
-            author="Front desk",
-            content=_nameplate("Front desk")
+    if missing := missing_provider_keys():
+        await _bubble(
+            "Front desk",
+            _nameplate("Front desk")
             + "The team can't reply until these keys are set on the server: "
             + ", ".join(f"`{key}`" for key in missing),
         ).send()
@@ -360,14 +407,24 @@ async def on_message(message: cl.Message):
     await _name_thread(message.content)
     _remember("You", message.content)
 
+    failed: list[str] = []
     for employee in TEAM:
         reply, ok = await take_turn(employee, message.content)
-        _remember(employee.name, reply)
-        if not ok:
-            await cl.Message(
-                author="Front desk",
-                content=_nameplate("Front desk")
-                + f"Stopped after {employee.name} hit that error, so the rest of the "
-                "team didn't run. Fix the issue above and send the message again.",
-            ).send()
-            return
+        if ok:
+            _remember(employee.name, reply)
+        else:
+            # The rest of the team still runs, but it should not treat an error as advice.
+            failed.append(employee.name)
+            _remember(
+                "Chat moderator",
+                f"{employee.name} could not reply this turn. Cover that ground yourself "
+                "and do not refer to its answer.",
+            )
+
+    if failed:
+        await _bubble(
+            "Front desk",
+            _nameplate("Front desk")
+            + f"{', '.join(failed)} could not reply this turn, so the plan above is "
+            "missing their input. Fix the error shown in their message and send again.",
+        ).send()
